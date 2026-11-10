@@ -1,0 +1,12 @@
+{
+  "legacy": {"version":1,"protected":["src"],"checks":[]},
+  "validUser": {"version":2,"scope":"user","workspaces":["/fixture/team"],"models":{"standard":"default"}},
+  "validWorkspace": {"version":2,"scope":"workspace","members":["project"],"policy":{"protected":["src"]}},
+  "validRepo": {"version":2,"scope":"repo","agents":[{"id":"planner","source":"agents/planner.md","version":"1"}]},
+  "invalid": [
+    {"name":"malformed","documents":["{\"version\":2,"],"error":"invalid JSON"},
+    {"name":"unknown key","documents":[{"version":2,"scope":"repo","model":"default"}],"error":"unknown field model"},
+    {"name":"ambiguous workspace","documents":[{"version":2,"scope":"user","workspaces":["/fixture/team","/fixture/team/nested"]},{"version":2,"scope":"workspace","members":["nested/project"]},{"version":2,"scope":"workspace","members":["project"]}],"error":"multiple workspaces claim /fixture/team/nested/project"},
+    {"name":"agent conflict","documents":[{"version":2,"scope":"user","agents":[{"id":"planner","source":"planner.md","version":"1"}]},{"version":2,"scope":"repo","agents":[{"id":"planner","source":"agents/planner.md","version":"2"}]}],"error":"conflicting agent planner"}
+  ]
+}
