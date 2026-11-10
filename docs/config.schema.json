@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "models": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "economy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "standard": {
+          "type": "string",
+          "minLength": 1
+        },
+        "high": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": []
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protected": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^(?![sS][cC][oO][pP][eE](?![\\s\\S]))[A-Za-z0-9_-]{1,40}(?![\\s\\S])"
+              },
+              "program": {
+                "type": "string",
+                "pattern": "\\S"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3600
+              }
+            },
+            "required": [
+              "id",
+              "program",
+              "args",
+              "timeout_seconds"
+            ]
+          }
+        }
+      },
+      "required": []
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*(?![\\s\\S])"
+          },
+          "uniqueItems": true
+        },
+        "deny": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*(?![\\s\\S])"
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": []
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 2
+        },
+        "scope": {
+          "const": "user"
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*(?![\\s\\S])"
+              },
+              "source": {
+                "type": "string",
+                "pattern": "^.+\\.md(?![\\s\\S])"
+              },
+              "version": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "id",
+              "source",
+              "version"
+            ]
+          }
+        },
+        "models": {
+          "$ref": "#/$defs/models"
+        },
+        "policy": {
+          "$ref": "#/$defs/policy"
+        },
+        "tools": {
+          "$ref": "#/$defs/tools"
+        },
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "version",
+        "scope"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 2
+        },
+        "scope": {
+          "const": "workspace"
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*(?![\\s\\S])"
+              },
+              "source": {
+                "type": "string",
+                "pattern": "^.+\\.md(?![\\s\\S])"
+              },
+              "version": {
+                "type": "string",
+                "minLength": 1
+              },
+              "override": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "id",
+              "source",
+              "version"
+            ]
+          }
+        },
+        "models": {
+          "$ref": "#/$defs/models"
+        },
+        "policy": {
+          "$ref": "#/$defs/policy"
+        },
+        "tools": {
+          "$ref": "#/$defs/tools"
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "version",
+        "scope",
+        "members"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 2
+        },
+        "scope": {
+          "const": "repo"
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*(?![\\s\\S])"
+              },
+              "source": {
+                "type": "string",
+                "pattern": "^.+\\.md(?![\\s\\S])"
+              },
+              "version": {
+                "type": "string",
+                "minLength": 1
+              },
+              "override": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "id",
+              "source",
+              "version"
+            ]
+          }
+        },
+        "models": {
+          "$ref": "#/$defs/models"
+        },
+        "policy": {
+          "$ref": "#/$defs/policy"
+        },
+        "tools": {
+          "$ref": "#/$defs/tools"
+        }
+      },
+      "required": [
+        "version",
+        "scope"
+      ]
+    }
+  ]
+}
