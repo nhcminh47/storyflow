@@ -2,6 +2,83 @@
 
 Framework điều phối agent cho software project. Mỗi lần chạy giao một user story cho ba worker theo thứ tự **planner → implementer → reviewer**. Orchestrator điều phối và chuyển bước. Rust CLI quản lý revision, chạy quality gate và ghi audit. Bộ công cụ chạy cục bộ bằng Git, không cần dịch vụ điều phối hay API key.
 
+## Kiến trúc ba scope (thiết kế dự kiến)
+
+Storyflow hướng tới một bộ agent có thể tái sử dụng ở **User → Workspace → Repository**, trong khi đơn vị thực thi nhỏ nhất vẫn là **một user story trong một Git worktree**. Ba scope dùng để **phân phối cấu hình và context**, không tạo ra ba state machine độc lập.
+
+> **Trạng thái triển khai:** CLI v0.1 hiện **chỉ hỗ trợ cấu hình ở repository**: `storyflow.json`, `agents/*.md` và `stories/<id>/` được đọc từ Git baseline đã pin. Các lệnh khởi tạo theo scope, config resolver và điều phối đa repo dưới đây là **đề xuất cho phiên bản tiếp theo**, chưa dùng được với binary hiện tại. `storyflow init ID [BASE]` ở phần [Lifecycle](#lifecycle) vẫn là lệnh **khởi tạo story run**, không phải cài đặt scope.
+
+### Phân chia trách nhiệm
+
+| Scope | Vị trí dự kiến | Sở hữu | Không sở hữu |
+| --- | --- | --- | --- |
+| **User / Global** | Thư mục cấu hình theo OS (ví dụ `~/.config/storyflow/`) | Agent templates dùng chung, model/provider defaults, skill registry, quyền và policy tối thiểu | Story state hoặc quy tắc nghiệp vụ riêng của repo |
+| **Workspace** | Root được khai báo tường minh, ví dụ `storyflow.workspace.json` | Danh sách repository, shared architecture, integration contracts, cross-repo dependencies và conventions | Ghi trực tiếp state của từng story |
+| **Repository** | `storyflow.json`, `agents/*.md`, `stories/` | Story scope, acceptance criteria, gate commands, hợp đồng agent áp dụng cho repo | Tự mở rộng quyền hoặc vô hiệu hóa policy bắt buộc từ scope cha |
+| **Story run** *(execution, không phải config scope)* | `.storyflow/<id>/` trong worktree | Revision, candidate commit, journal, gate evidence, task ledger và checkpoint | Định nghĩa lại policy đã chốt giữa một run |
+
+Ví dụ bố trí một workspace nhiều repo (minh họa **target design**, không phải cấu trúc bắt buộc của v0.1):
+
+```text
+~/.config/storyflow/             # User defaults (dự kiến)
+└── config.json
+product-workspace/
+├── storyflow.workspace.json     # Workspace marker (dự kiến)
+├── frontend/
+│   ├── storyflow.json           # Repo policy (đã có)
+│   ├── agents/                  # Agent contracts (đã có)
+│   ├── stories/                 # Story specs (đã có)
+│   └── .storyflow/<id>/         # Run state, gitignored (đã có)
+└── backend/
+    ├── storyflow.json
+    ├── agents/
+    └── stories/
+```
+
+Workspace Orchestrator (dự kiến) có thể phối hợp các story phụ thuộc nhau giữa nhiều repo. Tuy nhiên, **mỗi repo vẫn có story run, baseline, candidate, gate và audit riêng**. Không có một commit hay quality verdict dùng chung thay cho gate của từng repo.
+
+### Khởi tạo và kiểm tra scope (CLI đề xuất — chưa implement)
+
+```sh
+# Bootstrap cấu hình; khác với lệnh init story run hiện tại
+storyflow init --scope user
+storyflow init --scope workspace --path ./product-workspace
+storyflow init --scope repo
+
+# Chỉ inspect/validate, không tự động sửa source config
+storyflow config inspect --effective
+storyflow config validate
+
+# Hiện tại đã chạy được: khởi tạo user story run từ baseline
+storyflow init slug-001 HEAD
+```
+
+CLI cần phân biệt `init --scope <scope>` (bootstrap config) với `init <story-id> [base]` (khởi tạo run) để không phá tương thích. Vị trí workspace phải được khai báo/định danh rõ ràng; không tự đoán một workspace từ thư mục cha hoặc Git root.
+
+### Resolve cấu hình và trust boundary (đề xuất)
+
+```text
+Built-in defaults
+    ↓
+User config
+    ↓
+Workspace config (nếu được khai báo)
+    ↓
+Repo config
+    ↓
+Policy / trust validation
+    ↓
+Effective config → snapshot + hash tại lúc tạo story run
+```
+
+- **Thông số thông thường** (ví dụ model tier hoặc conventions): repo được ưu tiên hơn workspace, workspace được ưu tiên hơn user, nhưng chỉ với key được phép override. `inspect --effective` cần chỉ rõ giá trị và provenance của từng key.
+- **Agent Markdown**: resolve theo role/ID như **một contract hoàn chỉnh**, không nối nội dung nhiều file `.md`. Nếu sau này hỗ trợ `extends`, cần version, source và quy tắc conflict tường minh. Những agent contract được chọn phải được xác nhận trước khi dispatch.
+- **An toàn**: tập `protected` và mandatory quality gates chỉ được **giữ nguyên hoặc siết chặt**; quyền/tool access được lấy theo tập quyền hợp lệ giao nhau, không tự mở rộng từ repo. Cấu hình ngoài repo không được ngầm nâng quyền hoặc thay thế gate mà không có sự chấp thuận. Secrets nằm trong secure store hoặc environment được quản lý, không đưa vào Markdown, journal hay repo.
+- **Reproducibility**: resolve một lần khi bắt đầu run rồi snapshot/hash phiên bản config và agent contracts đã áp dụng. Một thay đổi user/workspace config sau đó **không được âm thầm đổi** policy của run đang chạy. Repo baseline pinning hiện có vẫn phải được duy trì.
+- **Failure mode**: thiếu scope, config conflict, agent không tương thích hoặc policy yếu hơn mức bắt buộc phải trả lỗi có thể giải thích được (**fail-closed**), không tự fallback sang contract lỏng hơn.
+
+Các quyết định này là **hướng thiết kế** cho config resolver và CLI bootstrap; chưa thay thế giao thức state/revision, Git gate và audit đang chạy trong v0.1.
+
 ## Chạy ví dụ
 
 Cần Git, Rust/Cargo từ 1.90 và PowerShell 7 cho script demo. Chạy hai lệnh dưới đây trong thư mục chứa `Cargo.toml` của Storyflow.
@@ -41,10 +118,10 @@ Sau khi build, chạy `pwsh -NoProfile -File examples/matrix/run.ps1`. Mỗi cas
 | `agents/*.md` | Hợp đồng orchestrator và ba worker. |
 | `stories/<id>/story.md` | User story và acceptance criteria có mã định danh. |
 | `stories/<id>/story.json` | Danh sách đường dẫn được sửa trong story. |
-| `storyflow.json` | Danh sách gate, đường dẫn được bảo vệ, chương trình, đối số và timeout. |
+| `storyflow.json` | Policy cấp repository hiện có: gate, đường dẫn được bảo vệ, chương trình, đối số và timeout. |
 | `src/` | CLI, state machine, journal, thao tác Git và gate runner. |
 | `examples/slug/` | App mẫu, acceptance tests độc lập và fixture cho demo. |
-| `.storyflow/<id>/` | Dữ liệu chạy cục bộ, được bỏ qua bởi Git. |
+| `.storyflow/<id>/` | Dữ liệu **story run** cục bộ trong worktree, được bỏ qua bởi Git; không phải user/workspace config. |
 
 ## Chạy với Cursor, Codex hoặc Claude Code
 
