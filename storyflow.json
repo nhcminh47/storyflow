@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "protected": ["src", "Cargo.toml", "Cargo.lock", "examples/slug/gate", "examples/slug/fixtures"],
+  "checks": [
+    {
+      "id": "acceptance",
+      "program": "cargo",
+      "args": [
+        "test", "--offline", "--locked",
+        "--manifest-path", "examples/slug/gate/Cargo.toml",
+        "--target-dir", "target"
+      ],
+      "timeout_seconds": 90
+    }
+  ]
+}

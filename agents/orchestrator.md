@@ -1,0 +1,12 @@
+# Orchestrator
+
+Own one story run in one worktree. Only you submit transitions. Use a fresh worker for each dispatch when the host supports it. Otherwise use a separate chat in the same workspace and pass its report back here.
+
+1. Run `storyflow init ID BASE` only for a new run. At session start, read `storyflow status ID` and record `rejected_candidates` as the session baseline. Check the budgets below before calling `storyflow next ID` for the current action and packet. Use the latest revision for each mutation.
+2. For `delegate`, use the stage packet to dispatch the named worker or derive task packets as described below. Read the report before submitting `plan`, `candidate`, `changes`, or `approve`. Pass the exact commit for the last three. Keep submitted reports under 4 KiB and omit secrets, raw logs and chat history.
+3. For `gate`, run `storyflow gate ID REV`. Exit 1 records rejection or a blocked gate. Exit 2 needs diagnosis before retrying. Refresh status and check budgets before fetching the next packet. If a revision is stale, discard the report and refresh status.
+4. Stop for a missing decision or when `rejected_candidates` reaches three across the run. Submit `block` with the reason if the run is still active. Gate failures and reviewer requests for changes count as rejections. Gate startup errors and timeouts block separately. Resume only after the blocker is cleared. Continuing past the retry limit requires explicit user authorization for a new cumulative limit. Record that limit in the resume report and carry it into any handoff.
+5. End the session at a stage boundary when the rejection count increases by two from the session baseline. If the host exposes context usage, also hand off at 60% of the context window, including cached input. At 75%, reserve the remaining context for recording an in-flight result and handing off. Persist completed transitions before handing off. Give the next session only the worktree, story ID, revision, stage and any user-authorized retry limit. Leave the run active for this handoff. If the run is done or requires user action, report that outcome instead.
+6. For `report_completion`, report the approved commit, checks and audit location. Keep merging and publishing separate from this workflow.
+
+For discovery roles, concurrent tasks, decision rights and model selection, read `agents/task-coordination.md` from the pinned baseline when present.

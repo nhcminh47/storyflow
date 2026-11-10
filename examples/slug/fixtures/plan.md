@@ -1,0 +1,4 @@
+- **AC1.** Duyệt từng ký tự ASCII hợp lệ và chuyển sang chữ thường.
+- **AC2.** Ghi nhận dấu phân cách đang chờ và chỉ thêm khi gặp nhóm tiếp theo.
+- **AC3.** Bỏ dấu đang chờ ở cuối và giữ đầu ra rỗng khi cần.
+- Xác minh bằng ba acceptance tests. Giới hạn thay đổi ở `app/src/lib.rs`.

@@ -1,0 +1,14 @@
+# Task coordination
+
+## Tasks within a stage
+
+- In plan, use BA for acceptance criteria and open business questions, Researcher for evidence and feasibility, and SA for design and interfaces. Run BA and Researcher together when their inputs are independent. SA waits for the relevant findings. Use Planner to turn the accepted outputs into tasks. Skip discovery roles when existing requirements and design are sufficient. Discovery workers are read-only in the project.
+- In implement, dispatch only tasks with completed dependencies and disjoint write scopes. Give each concurrent writer an isolated worktree based on the same recorded integration commit. Check each returned commit against that task's base and write scope before integration. Integrate in task order. If a conflict occurs, stop integration, record the blocker and resolve it before submitting one combined candidate. The story gate and reviewer evaluate that candidate.
+- Each task packet carries the story and stage revision, task ID, base, dependencies, required input references, acceptance criteria, `write_scope`, `decision_owner`, `model_tier` and `escalate_when`. Include only inputs relevant to the task. A task write scope must be inside the story scope. Workers return a short result, evidence references, blockers and a commit ID for code changes. Only the orchestrator records transitions.
+- Keep a task ledger under `.storyflow/<id>/tasks.md` in the story worktree. Record the stage revision, task inputs and dependencies, status, worktree, commit and decision references. Update it after each result and before handoff. Derive the ledger location from the worktree and story ID. On resume, reconcile it against current status and validate commits before reuse. Redispatch unfinished work only after confirming its previous worker has stopped.
+
+## Decisions and models
+
+- BA resolves interpretations within approved requirements. SA resolves technical choices within approved scope. Reviewer owns the verdict against the acceptance criteria and design. Orchestrator owns dispatch, integration and escalation. The user owns changes to approved scope, business rules and retry limits.
+- For a material disagreement, collect one short response per side with the disputed point, evidence, impact and proposal. The decision owner records a ruling and rationale in the task ledger. If evidence is missing, dispatch a focused check. If the issue is outside delegated authority, block with the decision needed.
+- Use `economy` for guided lookup and bounded mechanical work, `standard` for routine implementation, planning and review, and `high` for complex design, hard diagnosis or consequential disputes. Select per task and map tiers to available host models. If the host cannot select a model per worker, record the tier and actual model when known. Model choice does not grant permission to write, decide or submit transitions.

@@ -1,0 +1,4 @@
+- **AC1.** Chữ và số ASCII được giữ, chữ được chuyển về thường.
+- **AC2.** Dấu phân cách chỉ được thêm trước nhóm chữ hoặc số tiếp theo.
+- **AC3.** Bỏ phần phân cách ở biên và trả chuỗi rỗng nếu không có nhóm.
+- Scope và acceptance gate đã qua trên đúng commit được duyệt.

@@ -1,0 +1,3 @@
+- Dùng một lượt duyệt để giữ chữ, số ASCII và gộp dấu phân cách.
+- Giữ nguyên chữ ký hàm. Thay đổi duy nhất ở `app/src/lib.rs`.
+- Bàn giao commit cho acceptance gate kiểm tra AC1–AC3.
