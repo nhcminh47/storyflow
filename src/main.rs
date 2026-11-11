@@ -48,7 +48,7 @@ fn run() -> Result<u8> {
             repo::policy(&root, &base)?;
             repo::story(&root, &base, id)?;
             repo::spec(&root, &base, id)?;
-            for role in ["orchestrator", "planner", "implementer", "reviewer"] {
+            for role in storyflow::config::LEGACY_ROLES {
                 contract(&root, &base, role)?;
             }
             repo::pin(&root, id, 0, &base)?;

@@ -9,18 +9,7 @@ use std::{
 };
 
 pub const POLICY_PATH: &str = "storyflow.json";
-pub const RESERVED: &[&str] = &[
-    POLICY_PATH,
-    ".storyflow",
-    ".git",
-    ".gitignore",
-    ".gitattributes",
-    ".gitmodules",
-    "stories",
-    "agents",
-    "AGENTS.md",
-    "CLAUDE.md",
-];
+pub use storyflow::config::BUILTIN_PROTECTED as RESERVED;
 
 pub fn root() -> Result<PathBuf> {
     let output = checked(
