@@ -20,7 +20,13 @@ impl Fixture {
         Self::at("team/project")
     }
     fn at(relative: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
+        // Windows runner TEMP can contain 8.3 aliases rejected by the secure
+        // path reader. Use a short, workspace-local ignored test directory.
+        #[cfg(windows)]
+        let base = std::env::current_dir().unwrap().join("target").join("test-tmp");
+        #[cfg(not(windows))]
+        let base = std::env::temp_dir();
+        let root = base.join(format!(
             "sf4-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
