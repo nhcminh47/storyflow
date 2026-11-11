@@ -1,0 +1,72 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    # Use a canonical short runner temp path; Windows 8.3 TEMP aliases are
+    # deliberately rejected by the secure config reader's path validation.
+    env:
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Unit and integration tests
+        run: cargo test --locked --all-targets
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build CLI for PowerShell scenarios
+        if: matrix.os == 'windows-latest'
+        run: cargo build --locked
+
+      - name: Validate configuration schema fixtures
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: pwsh -NoProfile -File docs/config-fixtures/validate.ps1
+
+      - name: Run slug lifecycle demo
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: pwsh -NoProfile -File examples/slug/demo.ps1
+
+      - name: Run CLI scenario matrix
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: pwsh -NoProfile -File examples/matrix/run.ps1
