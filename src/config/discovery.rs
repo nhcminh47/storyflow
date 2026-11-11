@@ -183,9 +183,17 @@ pub(crate) fn discover(input: &ResolveInput) -> ConfigResult<Vec<LoadedScope>> {
     if let Some(root) = user_root {
         reject_checkout(&root.path, &user_at)?;
         let source = root.path.join("config.json").to_string_lossy().into_owned();
-        if let Some(bytes) =
-            root.read("config.json", true, &Origin::new(Scope::User, &source, "$"))?
-        {
+        let config_at = Origin::new(Scope::User, &source, "$");
+        if let Some(bytes) = root.read_checked("config.json", true, &config_at, |opened| {
+            let parent = opened.parent().ok_or_else(|| {
+                Diagnostic::new(
+                    "untrusted_user_location",
+                    &config_at,
+                    "opened user config has no parent directory",
+                )
+            })?;
+            reject_checkout(parent, &config_at)
+        })? {
             let document = parse_document(&bytes, Scope::User, &source)?;
             if let Document::User(user) = &document {
                 registrations = user.workspaces.clone();

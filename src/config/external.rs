@@ -88,6 +88,17 @@ impl TrustedRoot {
         optional: bool,
         origin: &Origin,
     ) -> ConfigResult<Option<Vec<u8>>> {
+        self.read_checked(relative, optional, origin, |_| Ok(()))
+    }
+    /// Validate the actual opened target before consuming bytes. Keep its handle
+    /// live across validation and reading; never reopen the validated pathname.
+    pub fn read_checked(
+        &self,
+        relative: &str,
+        optional: bool,
+        origin: &Origin,
+        validate: impl FnOnce(&Path) -> ConfigResult<()>,
+    ) -> ConfigResult<Option<Vec<u8>>> {
         validate_relative_path(relative, origin)?;
         let (mut handles, path) = match beneath(self, relative, false, origin) {
             Ok(value) => value,
@@ -101,6 +112,7 @@ impl TrustedRoot {
                 "opened artifact escaped trusted root",
             ));
         }
+        validate(&path)?;
         let mut bytes = Vec::new();
         handles
             .last_mut()
@@ -275,13 +287,24 @@ fn beneath(
     origin: &Origin,
 ) -> ConfigResult<(Vec<File>, PathBuf)> {
     use std::os::fd::AsRawFd;
-    linux_open(
-        root._handles.last().expect("root handle").as_raw_fd(),
-        Path::new(relative),
-        directory,
-        0x08 | 0x02,
-        origin,
-    )
+    let dir = root._handles.last().expect("root handle").as_raw_fd();
+    match linux_open(dir, Path::new(relative), directory, 0x08 | 0x02, origin) {
+        Err(error) if error.code == "missing_artifact" => {
+            // ENOENT after following a link does not establish that an optional
+            // entry is absent. Probe entries without following their final link,
+            // still anchored to the trusted descriptor and constrained beneath it.
+            if linux_entry_absent(dir, relative, origin)? {
+                Err(error)
+            } else {
+                Err(Diagnostic::new(
+                    "unsafe_filesystem",
+                    origin,
+                    "external entry changed during resolution",
+                ))
+            }
+        }
+        result => result,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -292,12 +315,87 @@ fn linux_open(
     resolve: u64,
     origin: &Origin,
 ) -> ConfigResult<(Vec<File>, PathBuf)> {
+    use std::os::fd::AsRawFd;
+    let flags = if directory {
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC
+    } else {
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC
+    };
+    let file = linux_open_handle(dir, path, flags, resolve, origin)?;
+    let meta = file.metadata().map_err(|_| {
+        Diagnostic::new("unsafe_filesystem", origin, "cannot inspect opened object")
+    })?;
+    if (directory && !meta.is_dir()) || (!directory && !meta.is_file()) {
+        return Err(Diagnostic::new(
+            "invalid_artifact_type",
+            origin,
+            "expected directory or regular file",
+        ));
+    }
+    let canonical =
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|_| {
+            Diagnostic::new(
+                "unsupported_secure_filesystem",
+                origin,
+                "opened-object identity requires procfs",
+            )
+        })?;
+    Ok((vec![file], canonical))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_entry_absent(dir: libc::c_int, relative: &str, origin: &Origin) -> ConfigResult<bool> {
+    let mut prefix = PathBuf::new();
+    for component in Path::new(relative).components() {
+        prefix.push(component);
+        let entry = match linux_open_handle(
+            dir,
+            &prefix,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0x08 | 0x02,
+            origin,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.code == "missing_artifact" => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        let meta = entry.metadata().map_err(|_| {
+            Diagnostic::new("unsafe_filesystem", origin, "cannot inspect external entry")
+        })?;
+        if meta.file_type().is_symlink() {
+            match linux_open_handle(
+                dir,
+                &prefix,
+                libc::O_PATH | libc::O_CLOEXEC,
+                0x08 | 0x02,
+                origin,
+            ) {
+                Err(error) if error.code == "missing_artifact" => {
+                    return Err(Diagnostic::new(
+                        "dangling_symlink",
+                        origin,
+                        "existing external symlink target is unavailable",
+                    ));
+                }
+                Err(error) => return Err(error),
+                Ok(_) => {}
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_open_handle(
+    dir: libc::c_int,
+    path: &Path,
+    flags: libc::c_int,
+    resolve: u64,
+    origin: &Origin,
+) -> ConfigResult<File> {
     use std::{
         ffi::CString,
-        os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::ffi::OsStrExt,
-        },
+        os::{fd::FromRawFd, unix::ffi::OsStrExt},
     };
     #[repr(C)]
     struct OpenHow {
@@ -307,11 +405,6 @@ fn linux_open(
     }
     let name = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| Diagnostic::new("invalid_path", origin, "NUL in external path"))?;
-    let flags = if directory {
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC
-    } else {
-        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC
-    };
     let how = OpenHow {
         flags: flags as u64,
         mode: 0,
@@ -342,26 +435,7 @@ fn linux_open(
         ));
     }
     // SAFETY: successful openat2 returned a newly owned descriptor.
-    let file = unsafe { File::from_raw_fd(fd as libc::c_int) };
-    let meta = file.metadata().map_err(|_| {
-        Diagnostic::new("unsafe_filesystem", origin, "cannot inspect opened object")
-    })?;
-    if (directory && !meta.is_dir()) || (!directory && !meta.is_file()) {
-        return Err(Diagnostic::new(
-            "invalid_artifact_type",
-            origin,
-            "expected directory or regular file",
-        ));
-    }
-    let canonical =
-        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|_| {
-            Diagnostic::new(
-                "unsupported_secure_filesystem",
-                origin,
-                "opened-object identity requires procfs",
-            )
-        })?;
-    Ok((vec![file], canonical))
+    Ok(unsafe { File::from_raw_fd(fd as libc::c_int) })
 }
 
 #[cfg(all(test, windows))]
@@ -393,6 +467,41 @@ mod tests {
         drop(handles);
         drop(root);
         std::fs::rename(path.join("agents"), path.join("replaced")).unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn checked_read_keeps_the_validated_handle_after_path_replacement() {
+        let path = std::env::temp_dir().join(format!(
+            "sf4-checked-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(path.join("trusted")).unwrap();
+        std::fs::write(path.join("trusted/p.md"), b"# original\r\n").unwrap();
+        std::fs::write(path.join("outside.md"), b"# untrusted replacement").unwrap();
+        let at = Origin::new(Scope::User, "checked-read-test", "artifact");
+        let root = TrustedRoot::establish(&path.join("trusted"), &at).unwrap();
+        let bytes = root
+            .read_checked("p.md", false, &at, |opened| {
+                assert_eq!(opened, root.path.join("p.md"));
+                std::fs::rename(opened, root.path.join("original.md")).unwrap();
+                std::os::unix::fs::symlink(path.join("outside.md"), opened).unwrap();
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"# original\r\n");
+        drop(root);
         std::fs::remove_dir_all(path).unwrap();
     }
 }

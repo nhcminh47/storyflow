@@ -36,7 +36,9 @@ Every registered root is opened, canonicalized and authorized before **any** wor
 
 Windows traversal opens each component with `OPEN_REPARSE_POINT`, retains ancestor handles, denies write/delete sharing and checks metadata and the final opened name. This blocks component replacement, rename and reparse mutation while consuming bytes. Short-name aliases fail lexical or opened-name validation. See the [CreateFile sharing and reparse semantics](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew). The handle regression attempts directory rename, file rename and overwrite while the read handles are live, then confirms rename succeeds after handles close.
 
-Linux traversal uses `openat2` relative to an owned directory descriptor with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`, validates the opened object's type and verifies its procfs identity before reading. Nonblocking open prevents a FIFO from hanging before type validation. The kernel constrains the lookup itself; canonicalize-then-open is never used. See [openat2](https://man7.org/linux/man-pages/man2/openat2.2.html).
+Linux traversal uses `openat2` relative to an owned directory descriptor with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`, validates the opened object's type and verifies its procfs identity before reading. User config reads additionally reject checkout ancestry of the **actual opened target** before consuming bytes, including links into nested in-root checkouts. The same handle remains live across validation and reading; replacing the pathname cannot redirect consumption. Nonblocking open prevents a FIFO from hanging before type validation. The kernel constrains the lookup itself; canonicalize-then-open is never used. See [openat2](https://man7.org/linux/man-pages/man2/openat2.2.html).
+
+An `ENOENT` from a link-following lookup does not prove that an optional entry is absent. Linux probes the requested entries with descriptor-relative `O_PATH | O_NOFOLLOW` opens, and separately validates any link targets with the same beneath/magic-link restrictions. Existing dangling symlinks return `dangling_symlink`; uncertain concurrent replacement fails closed. Only a genuinely absent entry permits omission. This also applies to the optional Storyflow directory and intermediate entries in an explicit location.
 
 Platform limits fail closed:
 
@@ -59,7 +61,7 @@ Validation on Rust 1.99.1 and PowerShell 7.6.9:
 | --- | --- |
 | `cargo fmt --check` | Passed |
 | `cargo test --locked` (Windows GNU) | 26 passed: 1 handle unit test + 25 integration tests; 0 failed/ignored |
-| `cargo test --locked` (WSL Ubuntu Linux) | 26 integration tests passed; 0 failed/ignored |
+| `cargo test --locked` (WSL Ubuntu Linux) | 30 passed: 1 handle unit test + 29 integration tests; 0 failed/ignored |
 | `cargo clippy --locked --all-targets -- -D warnings` | Passed on Windows GNU |
 | `pwsh -NoProfile -File docs/config-fixtures/validate.ps1` | 3 schema accepts, 12 rejects, 1 parser rejection; 46 v2 documents shape-checked; 30 semantic outcomes still labeled pending by this unchanged script |
 | `pwsh -NoProfile -File examples/slug/demo.ps1` | Done, revision 8, 9 journal events, expected initial red gate followed by scope + acceptance passing |

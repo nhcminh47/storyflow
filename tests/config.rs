@@ -1108,6 +1108,65 @@ mod resolver {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn linux_user_config_redirect_into_checkout_is_rejected_before_read() {
+        let f = Fixture::new();
+        let input = f.seed(&repo());
+        let checkout = f.user.join("Storyflow/checkout");
+        fs::create_dir(&checkout).unwrap();
+        git(&checkout, &["init", "-q"]);
+        f.document(
+            checkout.join("config.json"),
+            &json!({"version":2,"scope":"user","models":{"high":"project-controlled"}}),
+        );
+        std::os::unix::fs::symlink("checkout/config.json", f.user.join("Storyflow/config.json"))
+            .unwrap();
+        let error = resolve(&input).unwrap_err();
+        assert_eq!(error.code, "untrusted_user_location");
+        assert!(error.origin.source.ends_with("Storyflow/config.json"));
+        // The target's bytes must not be consumed before its ancestry is trusted.
+        fs::write(checkout.join("config.json"), [0xff]).unwrap();
+        code(resolve(&input), "untrusted_user_location");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_dangling_optional_config_is_invalid_but_absent_entry_is_allowed() {
+        let f = Fixture::new();
+        let input = f.seed(&repo());
+        let target = f.user.join("Storyflow/user.json");
+        f.document(&target, &json!({"version":2,"scope":"user","policy":{"checks":[check("lint",vec!["clippy"])],"protected":["future/output"]},"tools":{"deny":["write"]}}));
+        let link = f.user.join("Storyflow/config.json");
+        std::os::unix::fs::symlink("user.json", &link).unwrap();
+        let effective = resolve(&input).unwrap();
+        assert_eq!(effective.policy.checks.len(), 2);
+        assert!(!effective.capabilities.granted.contains("write"));
+        fs::remove_file(target).unwrap();
+        let error = resolve(&input).unwrap_err();
+        assert_eq!(error.code, "dangling_symlink");
+        assert!(error.origin.source.ends_with("Storyflow/config.json"));
+        fs::remove_file(link).unwrap();
+        assert_eq!(resolve(&input).unwrap().scopes.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_dangling_optional_user_directory_is_invalid() {
+        let f = Fixture::new();
+        let mut input = f.seed(&repo());
+        let directory = f.user.join("Storyflow");
+        fs::remove_dir(&directory).unwrap();
+        std::os::unix::fs::symlink("missing-directory", &directory).unwrap();
+        code(resolve(&input), "dangling_symlink");
+        fs::remove_file(directory).unwrap();
+        assert_eq!(resolve(&input).unwrap().scopes.len(), 1);
+        // Also inspect intermediate entries in an explicitly supplied location.
+        std::os::unix::fs::symlink("missing-parent", f.user.join("alias")).unwrap();
+        input.user_location.directory = "alias/Storyflow".into();
+        code(resolve(&input), "dangling_symlink");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_relative_in_root_links_and_member_identity() {
         let f = Fixture::new();
         let input = f.seed(&repo());
