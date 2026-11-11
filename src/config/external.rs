@@ -451,13 +451,13 @@ mod tests {
             .unwrap()
             .join("target")
             .join(format!(
-            "sf4-handles-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+                "sf4-handles-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         std::fs::create_dir_all(path.join("agents")).unwrap();
         std::fs::write(path.join("agents/p.md"), b"# exact\r\n").unwrap();
         let at = Origin::new(Scope::User, "handle-test", "artifact");
