@@ -11,14 +11,7 @@ pub enum Stage {
     Done,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Check {
-    pub id: String,
-    pub program: String,
-    pub args: Vec<String>,
-    pub timeout_seconds: u64,
-}
+pub use storyflow::config::Check;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
