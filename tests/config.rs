@@ -473,6 +473,9 @@ fn invoking_environment_paths_are_explicit() {
         ..Default::default()
     };
     assert!(UserLocation::from_environment(UserPlatform::Windows, &env).is_err());
+    #[cfg(windows)]
+    let base = std::env::current_dir().unwrap();
+    #[cfg(not(windows))]
     let base = std::env::temp_dir();
     let env = UserEnvironment {
         appdata: Some(base.clone()),
