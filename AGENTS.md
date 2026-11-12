@@ -27,3 +27,8 @@
 - If assigned a worker role, follow the assigned packet and return the report and any commit ID to the orchestrator. The orchestrator submits transitions, runs the gate, and reports the approved commit and audit location at completion.
 
 For other repository work, see [the README](README.md). Use a topic branch and a pull request targeting `master` to submit changes.
+
+## Configuration CLI
+
+- `storyflow init --scope user|workspace|repo [--path DIRECTORY]` creates a non-overwriting configuration skeleton, separately from story-run initialization. Repo skeletons require approved agents/checks and a commit before use.
+- `storyflow config inspect --effective` and `storyflow config validate` resolve committed HEAD without executing checks or changing runs. Inspection redacts model hints, programs/arguments and contract content; external scopes retain explicit invoking-user host trust requirements. See [configuration CLI](docs/config-cli.md).
