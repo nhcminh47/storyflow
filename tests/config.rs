@@ -23,7 +23,10 @@ impl Fixture {
         // Windows runner TEMP can contain 8.3 aliases rejected by the secure
         // path reader. Use a short, workspace-local ignored test directory.
         #[cfg(windows)]
-        let base = std::env::current_dir().unwrap().join("target").join("test-tmp");
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-tmp");
         #[cfg(not(windows))]
         let base = std::env::temp_dir();
         let root = base.join(format!(
