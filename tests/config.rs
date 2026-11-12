@@ -20,13 +20,14 @@ impl Fixture {
         Self::at("team/project")
     }
     fn at(relative: &str) -> Self {
-        // Windows runner TEMP can contain 8.3 aliases rejected by the secure
-        // path reader. Use a short, workspace-local ignored test directory.
+        // Windows TEMP can use 8.3 aliases, and User config must be outside
+        // any Git checkout. Place fixtures beside the checkout, not in target/.
         #[cfg(windows)]
         let base = std::env::current_dir()
             .unwrap()
-            .join("target")
-            .join("test-tmp");
+            .parent()
+            .expect("checkout has a parent")
+            .join("storyflow-test-tmp");
         #[cfg(not(windows))]
         let base = std::env::temp_dir();
         let root = base.join(format!(
