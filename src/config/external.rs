@@ -444,14 +444,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     #[test]
     fn opened_object_and_ancestors_cannot_be_replaced() {
-        let path = std::env::temp_dir().join(format!(
-            "sf4-handles-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // The Windows TEMP environment may contain an 8.3 alias (RUNNER~1),
+        // which is correctly refused by TrustedRoot. Keep the test fixture
+        // under Cargo's checkout instead of weakening production validation.
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "sf4-handles-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         std::fs::create_dir_all(path.join("agents")).unwrap();
         std::fs::write(path.join("agents/p.md"), b"# exact\r\n").unwrap();
         let at = Origin::new(Scope::User, "handle-test", "artifact");
