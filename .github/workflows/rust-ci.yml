@@ -19,11 +19,6 @@ jobs:
     name: Rust tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
-    # Use a canonical short runner temp path; Windows 8.3 TEMP aliases are
-    # deliberately rejected by the secure config reader's path validation.
-    env:
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
     strategy:
       fail-fast: false
       matrix:
