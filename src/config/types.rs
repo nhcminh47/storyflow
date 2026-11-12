@@ -96,7 +96,8 @@ pub enum Document {
 }
 
 /// An origin never contains a field value, command arguments or artifact text.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Origin {
     pub scope: Option<Scope>,
     pub source: String,
@@ -160,13 +161,15 @@ impl std::fmt::Display for Diagnostic {
 impl std::error::Error for Diagnostic {}
 pub type ConfigResult<T> = Result<T, Diagnostic>;
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Sourced<T> {
     pub value: T,
     pub origin: Origin,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedAgent {
     pub id: String,
     pub version: String,
@@ -177,14 +180,16 @@ pub struct ResolvedAgent {
     pub content: String,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EffectivePolicy {
     pub protected: Vec<Sourced<String>>,
     pub checks: Vec<Sourced<Check>>,
     pub builtin_scope_gate: Sourced<bool>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeIdentity {
     pub scope: Scope,
     pub root: String,
@@ -192,7 +197,8 @@ pub struct ScopeIdentity {
     pub baseline: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EffectiveCapabilities {
     pub granted: BTreeSet<String>,
     /// One decision for every host-supported capability, including the precise
@@ -201,13 +207,15 @@ pub struct EffectiveCapabilities {
     /// Ordered host grant and scope constraints, including origins of removals.
     pub constraints: Vec<Sourced<ToolCapabilitiesRecord>>,
 }
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ToolCapabilitiesRecord {
     pub allow: Option<Vec<String>>,
     pub deny: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EffectiveConfig {
     pub scopes: Vec<ScopeIdentity>,
     pub models: BTreeMap<String, Sourced<String>>,

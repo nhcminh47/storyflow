@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+use storyflow::snapshot::RunSnapshot;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +40,7 @@ pub struct Journal {
     id: String,
     pub records: Vec<Record>,
     pub state: Option<State>,
+    pub snapshot: Option<RunSnapshot>,
     _lock: File,
 }
 
@@ -99,6 +101,7 @@ impl Journal {
             id: id.into(),
             records: Vec::new(),
             state: None,
+            snapshot: None,
             _lock: lock,
         };
         let mut paths = fs::read_dir(events)?
@@ -126,7 +129,41 @@ impl Journal {
             journal.apply(&record.body.event)?;
             journal.records.push(record);
         }
+        if let Some(state) = &journal.state
+            && let Some(expected) = &state.config_sha256
+        {
+            let bytes = fs::read(journal.dir.join("config-snapshot.json")).map_err(
+                |_| "missing_config_snapshot: restore the original snapshot; rebind is unsupported",
+            )?;
+            let snapshot: RunSnapshot = serde_json::from_slice(&bytes).map_err(
+                |_| "invalid_config_snapshot: restore the original snapshot; rebind is unsupported",
+            )?;
+            snapshot.verify(id, &state.base, expected)?;
+            journal.snapshot = Some(snapshot);
+        }
         Ok(journal)
+    }
+
+    /// Only an empty run can bind inputs. Active runs cannot migrate or rebind.
+    pub fn pin_snapshot(&mut self, snapshot: RunSnapshot) -> Result<String> {
+        if self.state.is_some() {
+            return Err(
+                "config_rebind_unsupported: initialize a new story run on an approved baseline"
+                    .into(),
+            );
+        }
+        let digest = snapshot.digest()?;
+        snapshot.verify(&self.id, &snapshot.base, &digest)?;
+        let pending = self.dir.join("config-snapshot.pending.tmp");
+        {
+            let mut file = File::create(&pending)?;
+            serde_json::to_writer_pretty(&mut file, &snapshot)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+        }
+        fs::rename(pending, self.dir.join("config-snapshot.json"))?;
+        self.snapshot = Some(snapshot);
+        Ok(digest)
     }
 
     pub fn state(&self) -> Result<&State> {
@@ -152,6 +189,24 @@ impl Journal {
     }
 
     pub fn append(&mut self, event: Event) -> Result<usize> {
+        if let Event::Init {
+            story,
+            base,
+            config_sha256: Some(expected),
+        } = &event
+        {
+            self.snapshot
+                .as_ref()
+                .ok_or("missing_config_snapshot")?
+                .verify(story, base, expected)?;
+        }
+        // Validate a copy, publish memory only after the durable event has been renamed.
+        let mut next_state = self.state.clone();
+        if let Some(state) = &mut next_state {
+            state.apply(&event)?;
+        } else {
+            next_state = Some(State::new(&event, &self.id)?);
+        }
         let revision = self.records.len();
         let body = Body {
             schema: 1,
@@ -163,7 +218,6 @@ impl Journal {
                 .try_into()?,
             event,
         };
-        self.apply(&body.event)?;
         let record = Record {
             sha256: body.checksum()?,
             body,
@@ -177,6 +231,7 @@ impl Journal {
             file.sync_all()?;
         }
         fs::rename(pending, path)?;
+        self.state = next_state;
         self.records.push(record);
         Ok(revision)
     }

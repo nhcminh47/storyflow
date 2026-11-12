@@ -7,7 +7,7 @@ mod parser;
 mod paths;
 mod types;
 
-pub use compose::resolve;
+pub use compose::{resolve, resolve_repository};
 pub use discovery::{HostTrust, ResolveInput, UserEnvironment, UserLocation, UserPlatform};
 pub use git::GitBaseline;
 pub use parser::parse_document;

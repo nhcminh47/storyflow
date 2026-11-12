@@ -1,6 +1,6 @@
 # Internal configuration resolver
 
-`storyflow::config::resolve(&ResolveInput) -> ConfigResult<EffectiveConfig>` is an independent library API. The story CLI does not call it. There are no new commands, snapshots, providers, dispatch changes or runtime policy enforcement in this change. The approved [contract](config-scopes.md) and schema are unchanged.
+`storyflow::config::resolve(&ResolveInput) -> ConfigResult<EffectiveConfig>` is an independently usable library API. New story runs call the resolver and pin its output; see [run snapshots](run-snapshots.md) for CLI admission, replay, enforcement and compatibility. `resolve_repository` explicitly resolves only the approved repository tree without discovering external scopes. The [scoped document contract](config-scopes.md) and schema remain the source of validation rules.
 
 ## Inputs and output
 
@@ -28,7 +28,7 @@ Composition uses User → Workspace → Repo and ordered vectors for checks/cons
 
 V1 normalization retains legacy path validation, check constraints/order, protection floors, the 16 KiB policy limit and four pinned contracts with their existing nonblank 4 KiB limit. Artifact versions become `legacy-v1` in memory. User planner version `1` plus implicit repository planner version `legacy-v1` is an `agent_conflict`, even for identical bytes. Resolve it by explicitly migrating the repository document to v2 and declaring the intended agent with `override: true`; the resolver never rewrites input.
 
-The binary shares its unchanged `Check` shape, protection constants and legacy role list with the library. Its policy loading, baseline/candidate behavior, gate execution, state and journal remain unchanged. Required effective workers are planner, implementer and reviewer, derived from the existing context dispatcher. The legacy initializer also pins the orchestrator.
+The binary shares its `Check` shape, protection constants and legacy role list with the library. New initialization saves the effective configuration and agent bytes with a journal-bound digest; packets and gates consume those pinned inputs. Pre-snapshot journals keep their original baseline behavior. Required effective workers are planner, implementer and reviewer, derived from the existing context dispatcher. Legacy v1 initialization also pins the orchestrator.
 
 ## Filesystem and Git security
 
@@ -71,4 +71,4 @@ Validation on Rust 1.99.1 and PowerShell 7.6.9:
 
 The matrix initially failed with Git `'$GIT_DIR' too big` under the sandbox's long temp prefix. Both scripts passed with TEMP/TMP set to the shorter ignored `target/tmp` directory; their source was unchanged. The active GNU toolchain initially lacked formatter/Clippy components; installing those components made the exact requested commands available. The installed MSVC formatter worked, but MSVC Clippy could not link without `link.exe`; final validation uses GNU. Cargo also emitted sandbox incremental-cache hard-link fallback warnings; Clippy reported no code warnings. Linux Rust/linker setup was isolated in ignored `target` subdirectories because Ubuntu initially had neither Rust nor `cc`; tests themselves do not download tools or dependencies.
 
-The final source review checked contract/schema preservation, trust-before-read ordering, opened-object containment, replacement-object isolation, exact byte provenance, capability removal origins and CLI compatibility. Independent PR review remains required; no merge, issue closure or Issue #5 work is performed.
+The Issue #4 source review checked contract/schema preservation, trust-before-read ordering, opened-object containment, replacement-object isolation, exact byte provenance, capability removal origins and CLI compatibility. The validation results above describe that resolver baseline; Issue #5 integration and its separate regression suite are documented in [run snapshots](run-snapshots.md). Independent PR review remains required.

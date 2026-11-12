@@ -4,7 +4,29 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Resolve fresh inputs. This does not authorize execution or persist a run snapshot.
 pub fn resolve(input: &ResolveInput) -> ConfigResult<EffectiveConfig> {
-    for id in &input.supported_capabilities {
+    validate_capabilities(&input.supported_capabilities, &input.granted_capabilities)?;
+    compose(
+        discovery::discover(input)?,
+        &input.supported_capabilities,
+        &input.granted_capabilities,
+    )
+}
+
+/// Explicit repository-only mode; never discovers ambient user/workspace inputs.
+pub fn resolve_repository(
+    repository: &GitBaseline,
+    supported: &BTreeSet<String>,
+    granted: &BTreeSet<String>,
+) -> ConfigResult<EffectiveConfig> {
+    validate_capabilities(supported, granted)?;
+    compose(vec![discovery::repository(repository)?], supported, granted)
+}
+
+fn validate_capabilities(
+    supported: &BTreeSet<String>,
+    granted: &BTreeSet<String>,
+) -> ConfigResult<()> {
+    for id in supported {
         if !parser::identifier(id) {
             return Err(Diagnostic::new(
                 "invalid_capability",
@@ -13,17 +35,21 @@ pub fn resolve(input: &ResolveInput) -> ConfigResult<EffectiveConfig> {
             ));
         }
     }
-    if !input
-        .granted_capabilities
-        .is_subset(&input.supported_capabilities)
-    {
+    if !granted.is_subset(supported) {
         return Err(Diagnostic::new(
             "unknown_capability",
             &Origin::host("granted_capabilities"),
             "host grants an unsupported capability",
         ));
     }
-    let scopes = discovery::discover(input)?;
+    Ok(())
+}
+
+fn compose(
+    scopes: Vec<discovery::LoadedScope>,
+    supported: &BTreeSet<String>,
+    granted: &BTreeSet<String>,
+) -> ConfigResult<EffectiveConfig> {
     let mut effective = EffectiveConfig {
         scopes: scopes.iter().map(|s| s.identity.clone()).collect(),
         models: BTreeMap::new(),
@@ -51,15 +77,14 @@ pub fn resolve(input: &ResolveInput) -> ConfigResult<EffectiveConfig> {
             },
         },
         capabilities: EffectiveCapabilities {
-            granted: input.granted_capabilities.clone(),
-            provenance: input
-                .supported_capabilities
+            granted: granted.clone(),
+            provenance: supported
                 .iter()
                 .map(|id| {
                     (
                         id.clone(),
                         Sourced {
-                            value: input.granted_capabilities.contains(id),
+                            value: granted.contains(id),
                             origin: Origin::host("granted_capabilities"),
                         },
                     )
@@ -67,7 +92,7 @@ pub fn resolve(input: &ResolveInput) -> ConfigResult<EffectiveConfig> {
                 .collect(),
             constraints: vec![Sourced {
                 value: ToolCapabilitiesRecord {
-                    allow: Some(input.granted_capabilities.iter().cloned().collect()),
+                    allow: Some(granted.iter().cloned().collect()),
                     deny: None,
                 },
                 origin: Origin::host("granted_capabilities"),
@@ -181,7 +206,7 @@ pub fn resolve(input: &ResolveInput) -> ConfigResult<EffectiveConfig> {
         for (name, list) in [("allow", &data.tools.allow), ("deny", &data.tools.deny)] {
             for (i, id) in list.iter().flatten().enumerate() {
                 let at = origin.at(format!("$.tools.{name}[{i}]"));
-                if !input.supported_capabilities.contains(id) {
+                if !supported.contains(id) {
                     return Err(Diagnostic::new(
                         "unknown_capability",
                         &at,

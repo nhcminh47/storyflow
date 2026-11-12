@@ -13,7 +13,7 @@ pub use storyflow::config::BUILTIN_PROTECTED as RESERVED;
 
 pub fn root() -> Result<PathBuf> {
     let output = checked(
-        Command::new("git")
+        git(&std::env::current_dir()?)
             .args(["rev-parse", "--show-toplevel"])
             .output()?,
     )?;
@@ -24,6 +24,15 @@ pub fn root() -> Result<PathBuf> {
 
 pub fn git(root: &Path) -> Command {
     let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
     command.current_dir(root).env("GIT_NO_REPLACE_OBJECTS", "1");
     if cfg!(windows) {
         command.args(["-c", "core.longpaths=true"]);
@@ -179,6 +188,49 @@ pub fn changed_paths(root: &Path, base: &str, candidate: &str) -> Result<Vec<Str
         .split_terminator('\0')
         .map(str::to_owned)
         .collect())
+}
+
+/// Validate both trees as one portable namespace before a candidate checkout exists.
+pub fn validate_candidate_namespace(root: &Path, base: &str, candidate: &str) -> Result<()> {
+    use std::collections::BTreeMap;
+    use storyflow::config::{Origin, Scope, validate_relative_path};
+    let mut spellings = BTreeMap::<String, String>::new();
+    for commit in [base, candidate] {
+        let bytes = checked(
+            git(root)
+                .args(["ls-tree", "-r", "-z", "--name-only", commit])
+                .output()?,
+        )?;
+        let names =
+            String::from_utf8(bytes).map_err(|_| "invalid_path: non-UTF-8 candidate namespace")?;
+        for path in names.split_terminator('\0') {
+            let at = Origin::new(Scope::Repo, commit, "candidate_path");
+            validate_relative_path(path, &at)?;
+            let parts: Vec<_> = path.split('/').collect();
+            for end in 1..=parts.len() {
+                let prefix = parts[..end].join("/");
+                let key = portable_identity(&prefix);
+                if let Some(previous) = spellings.insert(key, prefix.clone())
+                    && previous != prefix
+                {
+                    return Err(
+                        "invalid_path: candidate aliases a baseline or candidate namespace entry"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn portable_identity(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    path.nfc()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .nfc()
+        .collect()
 }
 
 pub fn under(path: &str, prefix: &str) -> bool {
