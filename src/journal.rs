@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use storyflow::snapshot::RunSnapshot;
+use storyflow::snapshot::{MAX_SNAPSHOT_BYTES, RunSnapshot};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -132,9 +132,15 @@ impl Journal {
         if let Some(state) = &journal.state
             && let Some(expected) = &state.config_sha256
         {
-            let bytes = fs::read(journal.dir.join("config-snapshot.json")).map_err(
+            let file = File::open(journal.dir.join("config-snapshot.json")).map_err(
                 |_| "missing_config_snapshot: restore the original snapshot; rebind is unsupported",
             )?;
+            let mut bytes = Vec::new();
+            file.take(MAX_SNAPSHOT_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_SNAPSHOT_BYTES {
+                return Err("config_snapshot_too_large: stored snapshot exceeds 1 MiB; rebind is unsupported".into());
+            }
             let snapshot: RunSnapshot = serde_json::from_slice(&bytes).map_err(
                 |_| "invalid_config_snapshot: restore the original snapshot; rebind is unsupported",
             )?;
@@ -157,7 +163,7 @@ impl Journal {
         let pending = self.dir.join("config-snapshot.pending.tmp");
         {
             let mut file = File::create(&pending)?;
-            serde_json::to_writer_pretty(&mut file, &snapshot)?;
+            file.write_all(&snapshot.canonical_bytes()?)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
         }

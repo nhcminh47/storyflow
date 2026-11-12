@@ -16,6 +16,9 @@ pub use parser::parse_document;
 pub use paths::{protected_matches, validate_relative_path};
 pub use types::*;
 
+/// Every selected agent, including non-worker artifacts, has a bounded source read.
+pub const MAX_AGENT_BYTES: usize = 65_536;
+
 /// The worker mapping in main.rs's context dispatcher.
 pub const REQUIRED_WORKERS: &[&str] = &["planner", "implementer", "reviewer"];
 /// Contracts required by the existing v1 init path, including the orchestrator.

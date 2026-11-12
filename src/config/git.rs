@@ -1,7 +1,8 @@
 use super::*;
 use std::{
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 /// An exact approved commit, never a moving revision or working-tree document.
@@ -46,6 +47,51 @@ fn output(root: &Path, args: &[&str], origin: &Origin) -> ConfigResult<Vec<u8>> 
     }
     Ok(result.stdout)
 }
+
+fn bounded_output(
+    root: &Path,
+    args: &[&str],
+    origin: &Origin,
+    limit: usize,
+) -> ConfigResult<Vec<u8>> {
+    let mut child = command(root)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| Diagnostic::new("git_unavailable", origin, "Git could not be started"))?;
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .expect("piped Git stdout")
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() > limit {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(Diagnostic::new(
+            if read.is_err() {
+                "artifact_read_failed"
+            } else {
+                "artifact_too_large"
+            },
+            origin,
+            "bounded Git artifact read failed or exceeded byte limit",
+        ));
+    }
+    let status = child
+        .wait()
+        .map_err(|_| Diagnostic::new("git_lookup_failed", origin, "cannot collect Git result"))?;
+    if !status.success() {
+        return Err(Diagnostic::new(
+            "git_lookup_failed",
+            origin,
+            "authoritative Git lookup failed",
+        ));
+    }
+    Ok(bytes)
+}
 pub(crate) fn top_level(root: &Path, origin: &Origin) -> ConfigResult<PathBuf> {
     let bytes = output(root, &["rev-parse", "--show-toplevel"], origin)?;
     let path = std::str::from_utf8(&bytes)
@@ -76,6 +122,22 @@ impl GitBaseline {
         Ok(())
     }
     pub fn read(&self, path: &str, origin: &Origin) -> ConfigResult<Vec<u8>> {
+        self.read_with_limit(path, origin, None)
+    }
+    pub(crate) fn read_bounded(
+        &self,
+        path: &str,
+        origin: &Origin,
+        limit: usize,
+    ) -> ConfigResult<Vec<u8>> {
+        self.read_with_limit(path, origin, Some(limit))
+    }
+    fn read_with_limit(
+        &self,
+        path: &str,
+        origin: &Origin,
+        limit: Option<usize>,
+    ) -> ConfigResult<Vec<u8>> {
         validate_relative_path(path, origin)?;
         self.validate()?;
         let tree = output(
@@ -160,7 +222,12 @@ impl GitBaseline {
             }
             object = id;
         }
-        let bytes = output(&self.root, &["cat-file", "blob", &object], origin)?;
+        let args = ["cat-file", "blob", &object];
+        let bytes = if let Some(limit) = limit {
+            bounded_output(&self.root, &args, origin, limit)?
+        } else {
+            output(&self.root, &args, origin)?
+        };
         std::str::from_utf8(&bytes)
             .map_err(|_| Diagnostic::new("invalid_utf8", origin, "pinned artifact is not UTF-8"))?;
         Ok(bytes)

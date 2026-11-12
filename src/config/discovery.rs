@@ -85,9 +85,9 @@ impl LoadedScope {
     pub fn artifact(&self, path: &str, origin: &Origin) -> ConfigResult<Vec<u8>> {
         match &self.artifacts {
             ArtifactRoot::External(root) => root
-                .read(path, false, origin)?
+                .read_checked_bounded(path, false, origin, MAX_AGENT_BYTES, |_| Ok(()))?
                 .ok_or_else(|| Diagnostic::new("missing_artifact", origin, "artifact absent")),
-            ArtifactRoot::Git(baseline) => baseline.read(path, origin),
+            ArtifactRoot::Git(baseline) => baseline.read_bounded(path, origin, MAX_AGENT_BYTES),
         }
     }
     pub fn artifact_path(&self, path: &str) -> String {

@@ -3,9 +3,31 @@ use crate::config::{self, EffectiveConfig, GitBaseline, ResolveInput};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    io::{self, Write},
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Includes the trailing newline in the persisted compact JSON representation.
+pub const MAX_SNAPSHOT_BYTES: usize = 1_048_576;
+
+struct SnapshotBytes(Vec<u8>);
+impl Write for SnapshotBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > (MAX_SNAPSHOT_BYTES - 1).saturating_sub(self.0.len()) {
+            return Err(io::Error::other(
+                "config_snapshot_too_large: serialized snapshot exceeds 1 MiB",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +63,7 @@ impl RunSnapshot {
             effective,
         };
         snapshot.validate(story, base)?;
+        snapshot.canonical_bytes()?;
         Ok(snapshot)
     }
 
@@ -67,7 +90,14 @@ impl RunSnapshot {
     }
 
     pub fn digest(&self) -> Result<String> {
-        Ok(sha256(&serde_json::to_vec(self)?))
+        Ok(sha256(&self.canonical_bytes()?))
+    }
+
+    /// Bounded canonical encoding; reserve one byte for the on-disk newline.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = SnapshotBytes(Vec::new());
+        serde_json::to_writer(&mut bytes, self)?;
+        Ok(bytes.0)
     }
 
     pub fn verify(&self, story: &str, base: &str, expected: &str) -> Result<()> {
@@ -108,6 +138,9 @@ impl RunSnapshot {
             }
         }
         for (id, agent) in &self.effective.agents {
+            if agent.content.len() > config::MAX_AGENT_BYTES {
+                return Err("invalid_config_snapshot: agent exceeds 64 KiB".into());
+            }
             if id != &agent.id || agent.sha256 != sha256(agent.content.as_bytes()) {
                 return Err("invalid_config_snapshot: agent digest mismatch".into());
             }

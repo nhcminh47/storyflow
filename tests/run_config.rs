@@ -6,7 +6,10 @@ use std::{
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
 };
-use storyflow::{config::*, snapshot::RunSnapshot};
+use storyflow::{
+    config::*,
+    snapshot::{MAX_SNAPSHOT_BYTES, RunSnapshot},
+};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const ID: &str = "pin-001";
@@ -418,6 +421,8 @@ fn snapshot_tampering_and_loss_block_every_read_and_mutation() {
         }
         fs::write(f.snapshot(), &original).unwrap();
     }
+    let snapshot: RunSnapshot = serde_json::from_slice(&original).unwrap();
+    fs::write(f.snapshot(), serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
     assert_eq!(f.flow(&["status", ID], false, 0)["revision"], 0);
     assert!(
         f.flow(&["init", ID], false, 2)
@@ -524,6 +529,36 @@ fn snapshot_roundtrip_and_repeated_loads_have_identical_bytes_and_digests() {
     let replay: RunSnapshot = serde_json::from_slice(&bytes).unwrap();
     replay.verify(ID, &f.base, &a.digest().unwrap()).unwrap();
     assert_eq!(serde_json::to_vec(&replay).unwrap(), bytes);
+    // Verify the encoded-size boundary, including the reserved disk newline.
+    let mut boundary = a.clone();
+    boundary
+        .effective
+        .models
+        .get_mut("high")
+        .unwrap()
+        .value
+        .clear();
+    let overhead = serde_json::to_vec(&boundary).unwrap().len();
+    boundary.effective.models.get_mut("high").unwrap().value =
+        "x".repeat(MAX_SNAPSHOT_BYTES - 1 - overhead);
+    assert_eq!(
+        boundary.canonical_bytes().unwrap().len() + 1,
+        MAX_SNAPSHOT_BYTES
+    );
+    boundary
+        .effective
+        .models
+        .get_mut("high")
+        .unwrap()
+        .value
+        .push('x');
+    assert!(
+        boundary
+            .canonical_bytes()
+            .unwrap_err()
+            .to_string()
+            .contains("config_snapshot_too_large")
+    );
 }
 
 #[test]
@@ -731,6 +766,91 @@ fn oversized_host_context_is_rejected_by_the_secure_reader() {
     bytes.resize(MAX_HOST_CONTEXT_BYTES + 1, b' ');
     fs::write(&f.context, bytes).unwrap();
     assert_context_refused(&f, f.command(&["init", ID], true), "artifact_too_large");
+}
+
+#[test]
+fn oversized_snapshot_is_rejected_before_json_replay() {
+    let f = Fixture::new(false);
+    f.initialize(false);
+    let original = fs::read(f.snapshot()).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(f.snapshot())
+        .unwrap()
+        .set_len(MAX_SNAPSHOT_BYTES as u64 + 1)
+        .unwrap();
+    for args in [
+        vec!["status", ID],
+        vec!["audit", ID],
+        vec!["submit", ID, "0", "plan", "report.md"],
+    ] {
+        assert!(
+            f.flow(&args, false, 2)
+                .as_str()
+                .unwrap()
+                .contains("config_snapshot_too_large")
+        );
+    }
+    fs::write(f.snapshot(), original).unwrap();
+    assert_eq!(f.flow(&["status", ID], false, 0)["revision"], 0);
+}
+
+#[test]
+fn oversized_serialized_snapshot_cannot_be_published() {
+    let f = Fixture::new(true);
+    let mut repo: Value =
+        serde_json::from_slice(&fs::read(f.repo.join("storyflow.json")).unwrap()).unwrap();
+    // JSON escaping expands this allowed model hint beyond the serialized cap.
+    repo["models"] = json!({"high":"\u{0001}".repeat(MAX_SNAPSHOT_BYTES / 4)});
+    f.document("storyflow.json", repo);
+    f.commit();
+    assert_context_refused(
+        &f,
+        f.command(&["init", ID], true),
+        "config_snapshot_too_large",
+    );
+}
+
+#[test]
+fn nonworker_agents_have_bounded_git_and_external_sources() {
+    for external in [false, true] {
+        for length in [MAX_AGENT_BYTES, MAX_AGENT_BYTES + 1] {
+            let f = Fixture::new(true);
+            let byte = if length > MAX_AGENT_BYTES { 0xff } else { b'a' };
+            let content = vec![byte; length];
+            if external {
+                let mut user: Value = serde_json::from_slice(
+                    &fs::read(f.user.join("Storyflow/config.json")).unwrap(),
+                )
+                .unwrap();
+                user["agents"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id":"appendix","source":"appendix.md","version":"1"}));
+                fs::write(f.user.join("Storyflow/appendix.md"), content).unwrap();
+                f.parent(user);
+            } else {
+                let mut repo: Value =
+                    serde_json::from_slice(&fs::read(f.repo.join("storyflow.json")).unwrap())
+                        .unwrap();
+                repo["agents"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id":"appendix","source":"agents/appendix.md","version":"1"}));
+                fs::write(f.repo.join("agents/appendix.md"), content).unwrap();
+                f.document("storyflow.json", repo);
+                f.commit();
+            }
+            if length > MAX_AGENT_BYTES {
+                assert_context_refused(&f, f.command(&["init", ID], true), "artifact_too_large");
+            } else {
+                f.initialize(true);
+                assert!(fs::metadata(f.snapshot()).unwrap().len() <= MAX_SNAPSHOT_BYTES as u64);
+                let audit = f.flow(&["audit", ID], false, 0);
+                assert_eq!(audit["configuration"]["agents"]["appendix"]["version"], "1");
+            }
+        }
+    }
 }
 
 #[test]
