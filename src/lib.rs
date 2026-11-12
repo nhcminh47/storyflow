@@ -1,2 +1,3 @@
-//! Independently usable configuration resolution; the story CLI does not invoke this API.
+//! Configuration resolution and immutable run inputs.
 pub mod config;
+pub mod snapshot;

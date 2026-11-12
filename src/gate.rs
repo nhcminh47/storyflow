@@ -19,17 +19,36 @@ pub fn run(
     story: &Story,
     base: &str,
     candidate: &str,
+    validate_namespace: bool,
 ) -> Result<Vec<CheckResult>> {
+    if validate_namespace
+        && let Err(error) = repo::validate_candidate_namespace(root, base, candidate)
+    {
+        return Ok(vec![CheckResult {
+            id: "scope".into(),
+            outcome: Outcome::Fail,
+            exit_code: None,
+            detail: error.to_string(),
+            log: None,
+        }]);
+    }
     let changed = repo::changed_paths(root, base, candidate)?;
     let denied: Vec<_> = changed
         .iter()
         .filter(|path| {
-            let folded = path.to_lowercase();
+            let fold = |s: &str| {
+                if validate_namespace {
+                    repo::portable_identity(s)
+                } else {
+                    s.to_lowercase()
+                }
+            };
+            let folded = fold(path);
             repo::RESERVED
                 .iter()
                 .copied()
                 .chain(policy.protected.iter().map(String::as_str))
-                .any(|prefix| repo::under(&folded, &prefix.to_lowercase()))
+                .any(|prefix| repo::under(&folded, &fold(prefix)))
                 || !story.scope.iter().any(|prefix| repo::under(path, prefix))
         })
         .collect();

@@ -2,11 +2,11 @@
 
 Framework điều phối agent cho software project. Mỗi lần chạy giao một user story cho ba worker theo thứ tự **planner → implementer → reviewer**. Orchestrator điều phối và chuyển bước. Rust CLI quản lý revision, chạy quality gate và ghi audit. Bộ công cụ chạy cục bộ bằng Git, không cần dịch vụ điều phối hay API key.
 
-## Kiến trúc ba scope (thiết kế dự kiến)
+## Kiến trúc ba scope
 
 Storyflow hướng tới một bộ agent có thể tái sử dụng ở **User → Workspace → Repository**, trong khi đơn vị thực thi nhỏ nhất vẫn là **một user story trong một Git worktree**. Ba scope dùng để **phân phối cấu hình và context**, không tạo ra ba state machine độc lập.
 
-> **Trạng thái triển khai:** CLI v0.1 hiện **chỉ hỗ trợ cấu hình ở repository**: `storyflow.json`, `agents/*.md` và `stories/<id>/` được đọc từ Git baseline đã pin. Các lệnh khởi tạo theo scope, config resolver và điều phối đa repo dưới đây là **đề xuất cho phiên bản tiếp theo**, chưa dùng được với binary hiện tại. `storyflow init ID [BASE]` ở phần [Lifecycle](#lifecycle) vẫn là lệnh **khởi tạo story run**, không phải cài đặt scope.
+> **Trạng thái triển khai:** Rust resolver và snapshot cấu hình theo run đã có. `storyflow init ID [BASE]` mặc định resolve repository từ Git baseline; User/Workspace chỉ được bật qua trust input tường minh của host (`STORYFLOW_HOST_CONTEXT` và thư mục được cho phép riêng qua `STORYFLOW_HOST_CONTEXT_ROOT`, đều ngoài Git checkout). Run mới pin policy, provenance và toàn bộ agent contract; resume không đọc lại scope cha. CLI bootstrap/inspect/validate và điều phối đa repo bên dưới vẫn là đề xuất. Xem [run snapshots](docs/run-snapshots.md) về trust, giới hạn quyền và tương thích run cũ. `init ID [BASE]` vẫn là khởi tạo story run.
 
 ### Phân chia trách nhiệm
 
@@ -77,7 +77,7 @@ Effective config → snapshot + hash tại lúc tạo story run
 - **Reproducibility**: resolve một lần khi bắt đầu run rồi snapshot/hash phiên bản config và agent contracts đã áp dụng. Một thay đổi user/workspace config sau đó **không được âm thầm đổi** policy của run đang chạy. Repo baseline pinning hiện có vẫn phải được duy trì.
 - **Failure mode**: thiếu scope, config conflict, agent không tương thích hoặc policy yếu hơn mức bắt buộc phải trả lỗi có thể giải thích được (**fail-closed**), không tự fallback sang contract lỏng hơn.
 
-Các quyết định này là **hướng thiết kế** cho config resolver và CLI bootstrap; chưa thay thế giao thức state/revision, Git gate và audit đang chạy trong v0.1.
+Resolver, policy composition và snapshot đã được tích hợp vào run mới; giao thức state/revision và grammar story hiện có được giữ nguyên. CLI bootstrap và inspect/validate vẫn chưa implement. Run cũ không tự migrate; rebind cấu hình của run đang chạy chưa được hỗ trợ.
 
 ## Chạy ví dụ
 
@@ -183,7 +183,7 @@ Host giao task, chọn model và duy trì sổ task trong `.storyflow/<id>/tasks
 
 ## Quality gate và phục hồi
 
-- Baseline cố định spec, phạm vi, hợp đồng worker và gate policy. Gate so sánh cây Git của baseline với candidate. Candidate rỗng hoặc có file ngoài scope hay trong vùng bảo vệ sẽ trượt trước khi chạy chương trình. Phạm vi khớp đúng đường dẫn hoặc các file con, với dấu `/` làm ranh giới. Vùng bảo vệ được so khớp không phân biệt hoa thường.
+- Baseline cố định spec và phạm vi. Run mới lưu effective policy và agent bytes trong snapshot có digest gắn với journal; mọi lệnh kiểm tra snapshot trước khi dùng. Gate so sánh cây Git của baseline với candidate. Candidate rỗng, ngoài scope, trong vùng bảo vệ hoặc có alias đường dẫn không an toàn sẽ trượt trước khi chạy chương trình. Phạm vi dùng ranh giới `/`; vùng bảo vệ của run mới còn kiểm tra alias hoa thường và Unicode. Xem [chi tiết snapshot và phục hồi](docs/run-snapshots.md).
 - Gate runner tạo checkout tách biệt từ đúng candidate, rồi thực thi từng chương trình đã khai báo bằng danh sách đối số. Một check qua khi exit code bằng 0. Các gate dùng cùng một checkout và dừng ở check trượt đầu tiên. Kiểm tra ngữ nghĩa do reviewer thực hiện sau khi gate qua.
 - Kết quả có thể lặp lại với cùng commit, policy và môi trường thực thi. Demo khóa dependency bằng Cargo.lock và chạy acceptance test offline. Khi áp dụng vào CI, khóa cả toolchain, dependencies, dịch vụ thử nghiệm và dữ liệu test.
 - Gate thực thi mã của project với quyền của tiến trình gọi. Worktree tách biệt giúp cố định đầu vào Git. Với mã chưa được tin cậy, chạy CLI và gate trong môi trường thực thi cô lập. Timeout của skeleton dừng tiến trình trực tiếp; môi trường CI cần quản lý cả cây tiến trình nếu check sinh tiến trình con.

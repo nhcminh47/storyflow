@@ -85,9 +85,9 @@ impl LoadedScope {
     pub fn artifact(&self, path: &str, origin: &Origin) -> ConfigResult<Vec<u8>> {
         match &self.artifacts {
             ArtifactRoot::External(root) => root
-                .read(path, false, origin)?
+                .read_checked_bounded(path, false, origin, MAX_AGENT_BYTES, |_| Ok(()))?
                 .ok_or_else(|| Diagnostic::new("missing_artifact", origin, "artifact absent")),
-            ArtifactRoot::Git(baseline) => baseline.read(path, origin),
+            ArtifactRoot::Git(baseline) => baseline.read_bounded(path, origin, MAX_AGENT_BYTES),
         }
     }
     pub fn artifact_path(&self, path: &str) -> String {
@@ -106,7 +106,7 @@ fn identity(scope: Scope, root: &Path, source: String, baseline: Option<String>)
     }
 }
 
-fn reject_checkout(root: &Path, origin: &Origin) -> ConfigResult<()> {
+pub(crate) fn reject_checkout(root: &Path, origin: &Origin) -> ConfigResult<()> {
     // A broken Git marker must not turn a checkout into a trusted user directory.
     // Only inspect marker metadata; never consume project-controlled file bytes.
     for ancestor in root.ancestors() {
@@ -311,20 +311,27 @@ pub(crate) fn discover(input: &ResolveInput) -> ConfigResult<Vec<LoadedScope>> {
         ));
     }
     scopes.extend(matches);
-    let source = format!("{}:storyflow.json", input.repository.commit);
-    let bytes = input
-        .repository
-        .read("storyflow.json", &Origin::new(Scope::Repo, &source, "$"))?;
-    let document = parse_document(&bytes, Scope::Repo, &source)?;
-    scopes.push(LoadedScope {
-        identity: identity(
-            Scope::Repo,
-            &repo,
-            source,
-            Some(input.repository.commit.clone()),
-        ),
-        document,
-        artifacts: ArtifactRoot::Git(input.repository.clone()),
-    });
+    scopes.push(repository(&input.repository)?);
     Ok(scopes)
+}
+
+pub(crate) fn repository(repository: &GitBaseline) -> ConfigResult<LoadedScope> {
+    repository.validate()?;
+    let at = Origin::new(Scope::Repo, repository.root.to_string_lossy(), "repository");
+    let repo = git::top_level(&repository.root, &at)?;
+    if std::fs::canonicalize(&repository.root).ok().as_ref() != Some(&repo) {
+        return Err(Diagnostic::new(
+            "invalid_repository",
+            &at,
+            "repository context must be its Git top-level",
+        ));
+    }
+    let source = format!("{}:storyflow.json", repository.commit);
+    let bytes = repository.read("storyflow.json", &Origin::new(Scope::Repo, &source, "$"))?;
+    let document = parse_document(&bytes, Scope::Repo, &source)?;
+    Ok(LoadedScope {
+        identity: identity(Scope::Repo, &repo, source, Some(repository.commit.clone())),
+        document,
+        artifacts: ArtifactRoot::Git(repository.clone()),
+    })
 }

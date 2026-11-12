@@ -2,6 +2,7 @@ mod gate;
 mod journal;
 mod model;
 mod repo;
+mod run_config;
 
 use journal::Journal;
 use model::{CheckResult, Event, Stage, State};
@@ -16,7 +17,12 @@ storyflow status ID
 storyflow submit ID REV plan|block|resume REPORT.md
 storyflow submit ID REV candidate|approve|changes REPORT.md COMMIT
 storyflow gate ID REV
-storyflow audit ID";
+storyflow audit ID
+
+New runs pin effective configuration and agent contracts.
+STORYFLOW_HOST_CONTEXT=PATH enables explicit host-authorized User/Workspace inputs at init.
+STORYFLOW_HOST_CONTEXT_ROOT=DIR must separately authorize its external directory.
+Without it, init resolves only the pinned repository. Active runs cannot rebind configuration.";
 
 fn main() -> ExitCode {
     match run() {
@@ -45,16 +51,15 @@ fn run() -> Result<u8> {
                 return Err("run already exists; use next to continue it".into());
             }
             let base = repo::resolve(&root, rest.first().map(String::as_str).unwrap_or("HEAD"))?;
-            repo::policy(&root, &base)?;
             repo::story(&root, &base, id)?;
             repo::spec(&root, &base, id)?;
-            for role in storyflow::config::LEGACY_ROLES {
-                contract(&root, &base, role)?;
-            }
+            let snapshot = run_config::initialize(&root, id, &base)?;
             repo::pin(&root, id, 0, &base)?;
+            let config_sha256 = journal.pin_snapshot(snapshot)?;
             journal.append(Event::Init {
                 story: id.into(),
                 base,
+                config_sha256: Some(config_sha256),
             })?;
             summary(&journal, id)?
         }
@@ -62,7 +67,7 @@ fn run() -> Result<u8> {
         ("status", []) => summary(&journal, id)?,
         ("audit", []) => {
             journal.state()?;
-            json!({ "status": summary(&journal, id)?, "events": journal.records })
+            json!({ "status": summary(&journal, id)?, "configuration": journal.snapshot.as_ref().map(|s| s.audit()).transpose()?, "events": journal.records })
         }
         ("submit", [revision, action, report, commit @ ..]) => {
             journal.expect_revision(revision)?;
@@ -98,9 +103,38 @@ fn run() -> Result<u8> {
             let state = journal.state()?;
             require_stage(state, Stage::Gate)?;
             let commit = state.candidate.clone().ok_or("no candidate")?;
-            let policy = repo::policy(&root, &state.base)?;
+            let policy = if let Some(snapshot) = &journal.snapshot {
+                snapshot.require_cli_capabilities(&run_config::capabilities())?;
+                model::Policy {
+                    version: 1,
+                    protected: snapshot
+                        .effective
+                        .policy
+                        .protected
+                        .iter()
+                        .map(|p| p.value.clone())
+                        .collect(),
+                    checks: snapshot
+                        .effective
+                        .policy
+                        .checks
+                        .iter()
+                        .map(|c| c.value.clone())
+                        .collect(),
+                }
+            } else {
+                repo::policy(&root, &state.base)?
+            };
             let story = repo::story(&root, &state.base, id)?;
-            let checks = gate::run(&root, &journal.dir, &policy, &story, &state.base, &commit)?;
+            let checks = gate::run(
+                &root,
+                &journal.dir,
+                &policy,
+                &story,
+                &state.base,
+                &commit,
+                journal.snapshot.is_some(),
+            )?;
             let passed = checks.iter().all(CheckResult::passed);
             journal.append(Event::Gate {
                 commit,
@@ -141,6 +175,8 @@ fn summary(journal: &Journal, id: &str) -> Result<Value> {
         "blocked": state.blocked,
         "base": state.base,
         "candidate": state.candidate,
+        "config_sha256": state.config_sha256,
+        "config_mode": if journal.snapshot.is_some() { "snapshot-v1" } else { "legacy-baseline" },
     }))
 }
 
@@ -167,7 +203,11 @@ fn context(root: &Path, journal: &Journal, id: &str) -> Result<Value> {
     };
     let mut packet = json!({
         "status": status, "action": "delegate", "role": role,
-        "contract": contract(root, &state.base, role)?,
+        "contract": if let Some(snapshot) = &journal.snapshot {
+            snapshot.require_cli_capabilities(&run_config::capabilities())?;
+            snapshot.effective.agents.get(role).ok_or("pinned worker missing")?.content.clone()
+        } else { contract(root, &state.base, role)? },
+        "configuration": journal.snapshot.as_ref().map(|s| s.audit()).transpose()?,
         "story": repo::spec(root, &state.base, id)?,
         "scope": repo::story(root, &state.base, id)?.scope,
         "resume_note": state.resume_note,

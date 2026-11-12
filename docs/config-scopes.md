@@ -1,6 +1,6 @@
 # Scoped configuration, version 2
 
-User, Workspace and Repo are configuration scopes. A story run is the execution scope. This specification describes a future resolver. The shipped v0.1 CLI reads repository policy and worker contracts from the pinned Git baseline.
+User, Workspace and Repo are configuration scopes. A story run is the execution scope. The Rust resolver implements this specification. New CLI runs pin resolved inputs, using repository-only mode by default or explicit invoking-host trust for external scopes; see [run snapshots](run-snapshots.md). References to the original v0.1 CLI below describe historical binaries and pre-snapshot run compatibility. Scope bootstrap/inspect/validate commands remain proposed.
 
 ## Compatibility and migration
 
@@ -51,6 +51,8 @@ Protected paths and mandatory checks accumulate. Compare check IDs using ASCII l
 Start with host-granted capabilities. At each scope, reject explicit allow entries outside the incoming grants, intersect with any explicit allow list and subtract that scope's denies. Omitted lists impose no constraint. An allow and deny at the same scope resolves to deny. A child cannot re-grant a denied capability.
 
 Record each effective agent's ID, artifact version, declaring scope, source path and SHA-256 over the exact consumed Markdown bytes. Future initialization must snapshot effective policy and artifact bytes with hashes and the pinned commit before dispatch. Later external changes must not change the inputs of an existing run. Unsupported, malformed, ambiguous or unauthorized inputs stop resolution before dispatch.
+
+The [schema-1 run snapshot](run-snapshots.md) now implements initialization/replay pinning. New-run protection and candidate namespace checks conservatively normalize canonical Unicode and case aliases; the original `protected_matches` API and pre-snapshot runs retain their documented v0.1 matching. Active-run migration/rebind remains explicitly unsupported.
 
 ## Command grammar
 

@@ -58,6 +58,8 @@ pub enum Event {
     Init {
         story: String,
         base: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_sha256: Option<String>,
     },
     Plan {
         report: String,
@@ -83,9 +85,11 @@ pub enum Event {
     },
 }
 
+#[derive(Clone)]
 pub struct State {
     pub rejected_candidates: usize,
     pub base: String,
+    pub config_sha256: Option<String>,
     pub stage: Stage,
     pub blocked: bool,
     pub plan: Option<String>,
@@ -99,15 +103,27 @@ pub struct State {
 
 impl State {
     pub fn new(event: &Event, story: &str) -> Result<Self> {
-        let Event::Init { story: id, base } = event else {
+        let Event::Init {
+            story: id,
+            base,
+            config_sha256,
+        } = event
+        else {
             return Err("journal must begin with init".into());
         };
         if id != story || !crate::repo::is_commit_id(base) {
             return Err("invalid init event".into());
         }
+        if config_sha256
+            .as_ref()
+            .is_some_and(|v| v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err("invalid init config digest".into());
+        }
         Ok(Self {
             rejected_candidates: 0,
             base: base.clone(),
+            config_sha256: config_sha256.clone(),
             stage: Stage::Plan,
             blocked: false,
             plan: None,
