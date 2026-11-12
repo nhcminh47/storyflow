@@ -6,7 +6,7 @@ Framework điều phối agent cho software project. Mỗi lần chạy giao m�
 
 Storyflow hướng tới một bộ agent có thể tái sử dụng ở **User → Workspace → Repository**, trong khi đơn vị thực thi nhỏ nhất vẫn là **một user story trong một Git worktree**. Ba scope dùng để **phân phối cấu hình và context**, không tạo ra ba state machine độc lập.
 
-> **Trạng thái triển khai:** Rust resolver và snapshot cấu hình theo run đã có. `storyflow init ID [BASE]` mặc định resolve repository từ Git baseline; User/Workspace chỉ được bật qua trust input tường minh của host (`STORYFLOW_HOST_CONTEXT`). Run mới pin policy, provenance và toàn bộ agent contract; resume không đọc lại scope cha. CLI bootstrap/inspect/validate và điều phối đa repo bên dưới vẫn là đề xuất. Xem [run snapshots](docs/run-snapshots.md) về trust, giới hạn quyền và tương thích run cũ. `init ID [BASE]` vẫn là khởi tạo story run.
+> **Trạng thái triển khai:** Rust resolver và snapshot cấu hình theo run đã có. `storyflow init ID [BASE]` mặc định resolve repository từ Git baseline; User/Workspace chỉ được bật qua trust input tường minh của host (`STORYFLOW_HOST_CONTEXT` và thư mục được cho phép riêng qua `STORYFLOW_HOST_CONTEXT_ROOT`, đều ngoài Git checkout). Run mới pin policy, provenance và toàn bộ agent contract; resume không đọc lại scope cha. CLI bootstrap/inspect/validate và điều phối đa repo bên dưới vẫn là đề xuất. Xem [run snapshots](docs/run-snapshots.md) về trust, giới hạn quyền và tương thích run cũ. `init ID [BASE]` vẫn là khởi tạo story run.
 
 ### Phân chia trách nhiệm
 

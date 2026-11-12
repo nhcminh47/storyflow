@@ -139,16 +139,21 @@ impl Fixture {
         self.git(&["commit", "-qm", "fixture"]);
         self.git(&["rev-parse", "HEAD"])
     }
-    fn raw(&self, args: &[&str], scoped: bool) -> Output {
+    fn command(&self, args: &[&str], scoped: bool) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_storyflow"));
         cmd.current_dir(&self.repo)
             .args(args)
             .env_remove("STORYFLOW_HOST_CONTEXT")
+            .env_remove("STORYFLOW_HOST_CONTEXT_ROOT")
             .env("STORYFLOW_TEST_GATE_MARKER", self.root.join("gate-marker"));
         if scoped {
-            cmd.env("STORYFLOW_HOST_CONTEXT", &self.context);
+            cmd.env("STORYFLOW_HOST_CONTEXT", &self.context)
+                .env("STORYFLOW_HOST_CONTEXT_ROOT", &self.root);
         }
-        cmd.output().unwrap()
+        cmd
+    }
+    fn raw(&self, args: &[&str], scoped: bool) -> Output {
+        self.command(args, scoped).output().unwrap()
     }
     fn flow(&self, args: &[&str], scoped: bool, exit: i32) -> Value {
         let out = self.raw(args, scoped);
@@ -594,6 +599,140 @@ fn explicit_invalid_host_inputs_never_fall_back_to_repository_only() {
     }
 }
 
+fn assert_context_refused(f: &Fixture, mut command: Command, expected: &str) {
+    let out = command.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains(expected), "{error}");
+    assert!(!f.snapshot().exists());
+    assert!(
+        !f.repo
+            .join(".storyflow/pin-001/events/000000000000.json")
+            .exists()
+    );
+}
+
+#[test]
+fn host_context_needs_separate_absolute_external_authorization() {
+    for mode in [
+        "relative-file",
+        "relative-root",
+        "missing-root",
+        "root-only",
+        "outside-root",
+        "checkout-file",
+        "checkout-root",
+        "other-checkout",
+    ] {
+        let f = Fixture::new(true);
+        let bytes = fs::read(&f.context).unwrap();
+        f.write("host.json", std::str::from_utf8(&bytes).unwrap());
+        let mut cmd = f.command(&["init", ID], true);
+        let expected = match mode {
+            "relative-file" => {
+                cmd.env("STORYFLOW_HOST_CONTEXT", "./host.json");
+                "invalid_root"
+            }
+            "relative-root" => {
+                cmd.env("STORYFLOW_HOST_CONTEXT_ROOT", ".");
+                "invalid_root"
+            }
+            "missing-root" => {
+                cmd.env_remove("STORYFLOW_HOST_CONTEXT_ROOT");
+                "missing_host_context_root"
+            }
+            "root-only" => {
+                cmd.env_remove("STORYFLOW_HOST_CONTEXT");
+                "missing_host_context"
+            }
+            "outside-root" => {
+                cmd.env("STORYFLOW_HOST_CONTEXT_ROOT", &f.user);
+                "unauthorized_host_context"
+            }
+            "checkout-file" => {
+                cmd.env("STORYFLOW_HOST_CONTEXT", f.repo.join("host.json"));
+                "untrusted_host_context"
+            }
+            "checkout-root" => {
+                cmd.env("STORYFLOW_HOST_CONTEXT_ROOT", &f.repo)
+                    .env("STORYFLOW_HOST_CONTEXT", f.repo.join("host.json"));
+                "untrusted_host_context"
+            }
+            _ => {
+                let other = f.root.join("other-project");
+                fs::create_dir_all(&other).unwrap();
+                fs::write(other.join(".git"), "gitdir: unavailable").unwrap();
+                fs::write(other.join("host.json"), bytes).unwrap();
+                cmd.env("STORYFLOW_HOST_CONTEXT", other.join("host.json"));
+                "untrusted_host_context"
+            }
+        };
+        assert_context_refused(&f, cmd, expected);
+    }
+}
+
+#[test]
+fn checkout_context_is_rejected_before_utf8_decoding_or_parsing() {
+    let f = Fixture::new(true);
+    fs::write(f.repo.join("host.json"), [0xff, 0xfe]).unwrap();
+    let mut cmd = f.command(&["init", ID], true);
+    cmd.env("STORYFLOW_HOST_CONTEXT", f.repo.join("host.json"));
+    assert_context_refused(&f, cmd, "untrusted_host_context");
+}
+
+#[test]
+fn host_context_links_cannot_enter_checkout_or_escape_authorized_root() {
+    for confined_root in [false, true] {
+        let f = Fixture::new(true);
+        fs::write(f.repo.join("host.json"), fs::read(&f.context).unwrap()).unwrap();
+        let link = f.user.join("context-link");
+        #[cfg(windows)]
+        {
+            let out = Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(f.repo.to_str().unwrap().replace('/', "\\"))
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../team/project", &link).unwrap();
+        let mut cmd = f.command(&["init", ID], true);
+        cmd.env("STORYFLOW_HOST_CONTEXT", link.join("host.json"));
+        if confined_root {
+            cmd.env("STORYFLOW_HOST_CONTEXT_ROOT", &f.user);
+        }
+        #[cfg(windows)]
+        let expected = "path_escape";
+        #[cfg(not(windows))]
+        let expected = if confined_root {
+            "path_escape"
+        } else {
+            "untrusted_host_context"
+        };
+        assert_context_refused(&f, cmd, expected);
+    }
+}
+
+#[test]
+fn oversized_host_context_is_rejected_by_the_secure_reader() {
+    let f = Fixture::new(true);
+    let mut bytes = fs::read(&f.context).unwrap();
+    bytes.resize(MAX_HOST_CONTEXT_BYTES + 1, b' ');
+    fs::write(&f.context, bytes).unwrap();
+    assert_context_refused(&f, f.command(&["init", ID], true), "artifact_too_large");
+}
+
 #[test]
 fn ambient_git_redirects_cannot_replace_the_run_repository() {
     let f = Fixture::new(false);
@@ -601,6 +740,7 @@ fn ambient_git_redirects_cannot_replace_the_run_repository() {
         .current_dir(&f.repo)
         .args(["init", ID])
         .env_remove("STORYFLOW_HOST_CONTEXT")
+        .env_remove("STORYFLOW_HOST_CONTEXT_ROOT")
         .env("GIT_DIR", f.root.join("wrong-git"))
         .env("GIT_WORK_TREE", &f.user)
         .env("GIT_OBJECT_DIRECTORY", f.root.join("wrong-objects"))

@@ -106,7 +106,7 @@ fn identity(scope: Scope, root: &Path, source: String, baseline: Option<String>)
     }
 }
 
-fn reject_checkout(root: &Path, origin: &Origin) -> ConfigResult<()> {
+pub(crate) fn reject_checkout(root: &Path, origin: &Origin) -> ConfigResult<()> {
     // A broken Git marker must not turn a checkout into a trusted user directory.
     // Only inspect marker metadata; never consume project-controlled file bytes.
     for ancestor in root.ancestors() {

@@ -3,12 +3,10 @@ use crate::Result;
 use serde::Deserialize;
 use std::{
     collections::BTreeSet,
-    fs::File,
-    io::Read,
     path::{Path, PathBuf},
 };
 use storyflow::{
-    config::{GitBaseline, HostTrust, ResolveInput, UserLocation},
+    config::{GitBaseline, HostTrust, ResolveInput, UserLocation, read_host_context},
     snapshot::RunSnapshot,
 };
 
@@ -35,12 +33,11 @@ pub fn initialize(root: &Path, id: &str, base: &str) -> Result<RunSnapshot> {
         root: root.into(),
         commit: base.into(),
     };
-    let snapshot = if let Some(path) = std::env::var_os("STORYFLOW_HOST_CONTEXT") {
-        let mut bytes = Vec::new();
-        File::open(path)?.take(65_537).read_to_end(&mut bytes)?;
-        if bytes.len() > 65_536 {
-            return Err("host context exceeds 64 KiB".into());
-        }
+    let context_path = std::env::var_os("STORYFLOW_HOST_CONTEXT");
+    let authorized_root = std::env::var_os("STORYFLOW_HOST_CONTEXT_ROOT");
+    let snapshot = if let Some(path) = context_path {
+        let authorized_root = authorized_root.ok_or("missing_host_context_root: separately authorize an external host directory using STORYFLOW_HOST_CONTEXT_ROOT")?;
+        let bytes = read_host_context(Path::new(&path), Path::new(&authorized_root))?;
         let context: HostContext = serde_json::from_slice(&bytes)
             .map_err(|_| "invalid_host_context: expected versioned host trust inputs")?;
         if context.version != 1 {
@@ -63,6 +60,9 @@ pub fn initialize(root: &Path, id: &str, base: &str) -> Result<RunSnapshot> {
         };
         RunSnapshot::resolve(id, &input)?
     } else {
+        if authorized_root.is_some() {
+            return Err("missing_host_context: STORYFLOW_HOST_CONTEXT_ROOT requires an explicit manifest path".into());
+        }
         RunSnapshot::repository(id, &repository, &capabilities())?
     };
     snapshot.require_cli_capabilities(&capabilities())?;

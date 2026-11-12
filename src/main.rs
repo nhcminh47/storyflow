@@ -21,6 +21,7 @@ storyflow audit ID
 
 New runs pin effective configuration and agent contracts.
 STORYFLOW_HOST_CONTEXT=PATH enables explicit host-authorized User/Workspace inputs at init.
+STORYFLOW_HOST_CONTEXT_ROOT=DIR must separately authorize its external directory.
 Without it, init resolves only the pinned repository. Active runs cannot rebind configuration.";
 
 fn main() -> ExitCode {

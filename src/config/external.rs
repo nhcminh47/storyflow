@@ -99,6 +99,28 @@ impl TrustedRoot {
         origin: &Origin,
         validate: impl FnOnce(&Path) -> ConfigResult<()>,
     ) -> ConfigResult<Option<Vec<u8>>> {
+        self.read_checked_with_limit(relative, optional, origin, None, validate)
+    }
+
+    pub fn read_checked_bounded(
+        &self,
+        relative: &str,
+        optional: bool,
+        origin: &Origin,
+        limit: usize,
+        validate: impl FnOnce(&Path) -> ConfigResult<()>,
+    ) -> ConfigResult<Option<Vec<u8>>> {
+        self.read_checked_with_limit(relative, optional, origin, Some(limit), validate)
+    }
+
+    fn read_checked_with_limit(
+        &self,
+        relative: &str,
+        optional: bool,
+        origin: &Origin,
+        limit: Option<usize>,
+        validate: impl FnOnce(&Path) -> ConfigResult<()>,
+    ) -> ConfigResult<Option<Vec<u8>>> {
         validate_relative_path(relative, origin)?;
         let (mut handles, path) = match beneath(self, relative, false, origin) {
             Ok(value) => value,
@@ -117,6 +139,7 @@ impl TrustedRoot {
         handles
             .last_mut()
             .expect("walk includes file handle")
+            .take(limit.map_or(u64::MAX, |n| (n as u64).saturating_add(1)))
             .read_to_end(&mut bytes)
             .map_err(|_| {
                 Diagnostic::new(
@@ -125,6 +148,13 @@ impl TrustedRoot {
                     "cannot read opened artifact",
                 )
             })?;
+        if limit.is_some_and(|n| bytes.len() > n) {
+            return Err(Diagnostic::new(
+                "artifact_too_large",
+                origin,
+                "artifact exceeds configured byte limit",
+            ));
+        }
         std::str::from_utf8(&bytes)
             .map_err(|_| Diagnostic::new("invalid_utf8", origin, "artifact is not UTF-8"))?;
         Ok(Some(bytes))
@@ -498,7 +528,7 @@ mod linux_tests {
         let at = Origin::new(Scope::User, "checked-read-test", "artifact");
         let root = TrustedRoot::establish(&path.join("trusted"), &at).unwrap();
         let bytes = root
-            .read_checked("p.md", false, &at, |opened| {
+            .read_checked_bounded("p.md", false, &at, 128, |opened| {
                 assert_eq!(opened, root.path.join("p.md"));
                 std::fs::rename(opened, root.path.join("original.md")).unwrap();
                 std::os::unix::fs::symlink(path.join("outside.md"), opened).unwrap();
