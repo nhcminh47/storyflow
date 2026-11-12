@@ -1,0 +1,1 @@
+{"schema":1,"story":"demo-001","base":"1111111111111111111111111111111111111111","story_revision":0,"ledger_revision":1,"task":{"spec":{"id":"a","story":"demo-001","prerequisites":[],"stage":"plan","read_scope":["app"],"write_scope":["app/a.txt"],"acceptance_criteria":["AC1"],"decision_owner":"orchestrator"},"revision":1,"status":"running","result":null},"prerequisites":{}}
