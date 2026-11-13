@@ -142,6 +142,12 @@ fn subprocess_fixture() {
                             | "WINDIR"
                             | "COMSPEC"
                             | "PATHEXT"
+                            | "SYSTEMDRIVE"
+                            | "PROGRAMDATA"
+                            | "ALLUSERSPROFILE"
+                            | "USERPROFILE"
+                            | "LOCALAPPDATA"
+                            | "APPDATA"
                             | "TZ"
                             | "LC_ALL"
                             | "PROGRAMFILES"
@@ -316,4 +322,52 @@ fn timeout_confirms_descendants_with_closed_output_pipes_stopped() {
     assert!(result.timed_out);
     assert!(fixture.0.join("ready").exists());
     assert_descendants_stopped(&fixture);
+}
+
+#[cfg(windows)]
+#[test]
+fn msvc_installation_discovery_survives_environment_filtering() {
+    let Some(base) = std::env::var_os("ProgramFiles(x86)") else {
+        return;
+    };
+    let probe = PathBuf::from(base).join("Microsoft Visual Studio/Installer/vswhere.exe");
+    if !probe.is_file() {
+        return;
+    } // GNU-only local hosts have no MSVC installer.
+    let args: Vec<String> = [
+        "-latest",
+        "-products",
+        "*",
+        "-requires",
+        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+        "-property",
+        "installationPath",
+    ]
+    .map(str::to_owned)
+    .into();
+    let original = Command::new(&probe).args(&args).output().unwrap();
+    assert!(original.status.success());
+    if original.stdout.iter().all(u8::is_ascii_whitespace) {
+        return;
+    }
+    let fixture = Fixture::new("environment");
+    let filtered = run(
+        &CommandSpec {
+            program: probe.to_string_lossy().into_owned(),
+            args,
+            timeout: Duration::from_secs(15),
+        },
+        &fixture.0,
+    )
+    .unwrap();
+    assert!(
+        filtered.status.unwrap().success(),
+        "{}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&filtered.stdout).trim(),
+        String::from_utf8_lossy(&original.stdout).trim(),
+        "filtered MSVC discovery lost its installation"
+    );
 }

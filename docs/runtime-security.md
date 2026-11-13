@@ -124,7 +124,8 @@ trusted commands. Candidate identity, check outcomes, timeout blocking, revision
 log references and audit semantics remain intact. A timeout cannot pass.
 
 The process runner clears the environment, retaining only `PATH`, `TEMP`, `TMP`, `TMPDIR` and, on Windows,
-`SystemRoot`, `WINDIR`, `ComSpec`, `PATHEXT` and the explicit MSVC location profile
+`SystemRoot`, `WINDIR`, `ComSpec`, `PATHEXT`, `SystemDrive`, `ProgramData`,
+`ALLUSERSPROFILE`, `USERPROFILE`, `LOCALAPPDATA`, `APPDATA` and the explicit MSVC location profile
 (`ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432`, `VSINSTALLDIR`, `VCINSTALLDIR`,
 `VCToolsInstallDir`, `VCToolsVersion`, `WindowsSdkDir`, `WindowsSDKVersion`,
 `LIB`, `LIBPATH`, `INCLUDE`, `VSCMD_ARG_TGT_ARCH`, `VSCMD_ARG_VCVARS_SPECTRE`).
@@ -203,7 +204,8 @@ Primary API references: [Windows CreateFileW](https://learn.microsoft.com/en-us/
 [Linux openat](https://man7.org/linux/man-pages/man2/openat.2.html),
 [Git environment and no-lazy-fetch](https://git-scm.com/docs/git).
 Windows MSVC discovery is validated by the CI slug demo; retaining Program Files
-locations is required for vswhere, as described in the
+and Windows profile/data locations is required for installer discovery. A platform test
+compares filtered vswhere discovery against the invoking host. References:
 [Microsoft installer documentation](https://github.com/microsoft/vswhere/wiki/Installing)
 and [Rust MSVC discovery source](https://github.com/rust-lang/cc-rs/blob/main/find-msvc-tools/src/find_tools.rs).
 ## Contract Change Request CCR-9-2 (pending)
