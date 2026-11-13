@@ -1,0 +1,1 @@
+{"schema":1,"lease":{"attempt_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","lease_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","owner":"host-1"},"result":{"schema":1,"story":"demo-001","task":"a","task_revision":1,"status":"succeeded","report":"AC1 verified","commit":null,"artifacts":[]},"worker_stopped":true}
