@@ -15,7 +15,28 @@ use std::{env, process::ExitCode};
 use storyflow::tasks::*;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const USAGE: &str = "storyflow-tasks init ID GRAPH.json\nstoryflow-tasks replace ID REV GRAPH.json\nstoryflow-tasks view ID [--markdown]\nstoryflow-tasks packet ID TASK\nstoryflow-tasks start ID REV TASK TASK_REV\nstoryflow-tasks complete ID REV RESULT.json\n\nTask bookkeeping only: never launches a worker or approves a story.\nUses an initialized story's pinned base, scope, stage and current revision.\nReplace explicitly publishes a new graph after the story revision changes.\nJSON output; success 0, rejected/operational error 2. No-task view is additive.";
+const USAGE: &str = "storyflow-tasks init ID GRAPH.json\n\
+storyflow-tasks replace ID REV GRAPH.json\n\
+storyflow-tasks view ID [--markdown]\n\
+storyflow-tasks packet ID TASK\n\
+storyflow-tasks start ID REV TASK TASK_REV\n\
+storyflow-tasks complete ID REV RESULT.json\n\
+storyflow-tasks configure ID REV POLICY.json\n\
+storyflow-tasks status ID\n\
+storyflow-tasks dispatch ID REV TASK TASK_REV OWNER\n\
+storyflow-tasks heartbeat ID REV LEASE.json\n\
+storyflow-tasks finish ID REV ATTEMPT_RESULT.json\n\
+storyflow-tasks cancel ID REV TASK TASK_REV REASON\n\
+storyflow-tasks recover ID REV\n\
+storyflow-tasks stopped ID REV LEASE.json REASON\n\
+storyflow-tasks retry ID REV TASK TASK_REV REASON\n\n\
+Uses an initialized story's pinned base, scope, stage and current revision.\n\
+Configure opts into durable leases; legacy start/complete are then refused.\n\
+Dispatch reserves a lease; the host launches workers and confirms they stopped.\n\
+Expiry/cancellation/graph replacement do not prove a worker has stopped.\n\
+Replace explicitly publishes a new graph after the story revision changes.\n\
+Never launches a worker, integrates commits or approves a story.\n\
+JSON output except --markdown; success 0, rejected/operational error 2.";
 
 fn main() -> ExitCode {
     match run() {
@@ -45,9 +66,38 @@ fn run() -> Result<()> {
             | ("packet", [_])
             | ("start", [_, _, _])
             | ("complete", [_, _])
+            | ("configure", [_, _])
+            | ("status", [])
+            | ("dispatch", [_, _, _, _])
+            | ("heartbeat", [_, _])
+            | ("finish", [_, _])
+            | ("cancel", [_, _, _, _])
+            | ("recover", [_])
+            | ("stopped", [_, _, _])
+            | ("retry", [_, _, _, _])
     ) || (command == "view" && !(rest.is_empty() || rest == ["--markdown"]))
     {
         return Err(USAGE.into());
+    }
+    // Revisions are grammar, so malformed numbers cannot create task storage.
+    if matches!(
+        command.as_str(),
+        "replace"
+            | "start"
+            | "complete"
+            | "configure"
+            | "dispatch"
+            | "heartbeat"
+            | "finish"
+            | "cancel"
+            | "recover"
+            | "stopped"
+            | "retry"
+    ) {
+        rest[0].parse::<u64>()?;
+    }
+    if matches!(command.as_str(), "start" | "dispatch" | "cancel" | "retry") {
+        rest[2].parse::<u64>()?;
     }
     let root = repo::root()?;
     let story = journal::Journal::open(&root, id, false)?;
@@ -81,18 +131,14 @@ fn run() -> Result<()> {
         protected,
     };
     let mut tasks = TaskJournal::open(&root, context)?;
+    let clock = SystemClock;
     let output = match (command.as_str(), rest) {
         ("init", [path]) => {
-            tasks.initialize(serde_json::from_slice(&read_document(
-                std::path::Path::new(path),
-            )?)?)?;
+            tasks.initialize(read_json(path)?)?;
             serde_json::to_value(tasks.view())?
         }
         ("replace", [revision, path]) => {
-            tasks.replace(
-                revision.parse()?,
-                serde_json::from_slice(&read_document(std::path::Path::new(path))?)?,
-            )?;
+            tasks.replace(revision.parse()?, read_json(path)?)?;
             serde_json::to_value(tasks.view())?
         }
         ("view", []) => serde_json::to_value(tasks.view())?,
@@ -105,11 +151,57 @@ fn run() -> Result<()> {
             serde_json::to_value(tasks.start(revision.parse()?, task, task_revision.parse()?)?)?
         }
         ("complete", [revision, path]) => {
-            tasks.complete(
-                revision.parse()?,
-                serde_json::from_slice(&read_document(std::path::Path::new(path))?)?,
-            )?;
+            tasks.complete(revision.parse()?, read_json(path)?)?;
             serde_json::to_value(tasks.view())?
+        }
+        ("configure", [revision, path]) => {
+            tasks.configure_scheduler(revision.parse()?, read_json(path)?, &clock)?;
+            serde_json::to_value(tasks.scheduler_status(&clock)?)?
+        }
+        ("status", []) => serde_json::to_value(tasks.scheduler_status(&clock)?)?,
+        ("dispatch", [revision, task, task_revision, owner]) => {
+            serde_json::to_value(tasks.dispatch(
+                revision.parse()?,
+                task,
+                task_revision.parse()?,
+                owner,
+                &clock,
+            )?)?
+        }
+        ("heartbeat", [revision, path]) => {
+            tasks.heartbeat(revision.parse()?, &read_json(path)?, &clock)?;
+            serde_json::to_value(tasks.scheduler_status(&clock)?)?
+        }
+        ("finish", [revision, path]) => {
+            tasks.complete_attempt(revision.parse()?, read_json(path)?, &clock)?;
+            serde_json::to_value(tasks.scheduler_status(&clock)?)?
+        }
+        ("cancel", [revision, task, task_revision, reason]) => {
+            tasks.cancel_task(
+                revision.parse()?,
+                task,
+                task_revision.parse()?,
+                reason,
+                &clock,
+            )?;
+            serde_json::to_value(tasks.scheduler_status(&clock)?)?
+        }
+        ("recover", [revision]) => {
+            tasks.recover_expired(revision.parse()?, &clock)?;
+            serde_json::to_value(tasks.scheduler_status(&clock)?)?
+        }
+        ("stopped", [revision, path, reason]) => {
+            tasks.confirm_stopped(revision.parse()?, &read_json(path)?, reason, &clock)?;
+            serde_json::to_value(tasks.scheduler_status(&clock)?)?
+        }
+        ("retry", [revision, task, task_revision, reason]) => {
+            serde_json::to_value(tasks.retry_task(
+                revision.parse()?,
+                task,
+                task_revision.parse()?,
+                reason,
+                &clock,
+            )?)?
         }
         _ => return Err(USAGE.into()),
     };
@@ -118,4 +210,10 @@ fn run() -> Result<()> {
     drop(tasks);
     drop(story);
     Ok(())
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
+    Ok(serde_json::from_slice(&read_document(
+        std::path::Path::new(path),
+    )?)?)
 }

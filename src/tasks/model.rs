@@ -1,3 +1,4 @@
+use super::scheduler::{self, SchedulerEvent, SchedulerState};
 use crate::config::{Origin, Scope, validate_relative_path};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -240,6 +241,7 @@ pub enum TaskStatus {
     Succeeded,
     Failed,
     Blocked,
+    Cancelled,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -263,7 +265,7 @@ pub struct WorkerResult {
     pub artifacts: Vec<Artifact>,
 }
 impl WorkerResult {
-    fn validate(&self) -> TaskResult<()> {
+    pub(crate) fn validate(&self) -> TaskResult<()> {
         require(
             self.schema == SCHEMA,
             "task_schema",
@@ -331,6 +333,8 @@ pub struct TaskView {
     pub revision: Option<u64>,
     pub tasks: BTreeMap<String, TaskState>,
     pub ready: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<SchedulerState>,
 }
 impl TaskView {
     pub(crate) fn empty(context: &RunContext) -> Self {
@@ -343,6 +347,7 @@ impl TaskView {
             revision: None,
             tasks: BTreeMap::new(),
             ready: Vec::new(),
+            scheduler: None,
         }
     }
     pub(crate) fn refresh(&mut self) {
@@ -443,12 +448,14 @@ pub enum TaskEvent {
     Replace { graph: TaskGraph },
     Start { task: String, task_revision: u64 },
     Complete { result: WorkerResult },
+    Scheduler { event: SchedulerEvent },
 }
 
 pub(crate) fn apply(
     view: &mut TaskView,
     context: &RunContext,
     event: &TaskEvent,
+    graph_revision: u64,
 ) -> TaskResult<()> {
     match event {
         TaskEvent::Define { graph } | TaskEvent::Replace { graph } => {
@@ -481,6 +488,7 @@ pub(crate) fn apply(
             )?;
             view.story_revision = graph.story_revision;
             view.stage = graph.stage;
+            scheduler::retire_graph(view, graph_revision);
             view.tasks.clear();
             for spec in &graph.tasks {
                 view.tasks.insert(
@@ -498,6 +506,11 @@ pub(crate) fn apply(
             task,
             task_revision,
         } => {
+            require(
+                view.scheduler.is_none(),
+                "scheduler_managed",
+                "use dispatch for scheduler-managed tasks",
+            )?;
             let state = view
                 .tasks
                 .get_mut(task)
@@ -516,6 +529,11 @@ pub(crate) fn apply(
             state.revision += 1;
         }
         TaskEvent::Complete { result } => {
+            require(
+                view.scheduler.is_none(),
+                "scheduler_managed",
+                "use complete_attempt for scheduler-managed tasks",
+            )?;
             result.validate()?;
             require(
                 result.story == view.story,
@@ -544,6 +562,7 @@ pub(crate) fn apply(
             state.revision += 1;
             state.result = Some(result.clone());
         }
+        TaskEvent::Scheduler { event } => scheduler::apply(view, graph_revision, event)?,
     }
     view.refresh();
     Ok(())
@@ -591,7 +610,7 @@ pub(crate) fn within(path: &str, prefix: &str) -> bool {
             .strip_prefix(prefix)
             .is_some_and(|s| s.starts_with('/'))
 }
-fn fold(s: &str) -> String {
+pub(crate) fn fold(s: &str) -> String {
     s.nfc().flat_map(char::to_lowercase).collect()
 }
 pub(crate) fn commit_id(s: &str) -> bool {

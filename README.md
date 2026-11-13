@@ -169,7 +169,7 @@ Trong bước `plan`, orchestrator có thể giao BA làm rõ yêu cầu và Res
 
 Trong bước `implement`, các task đủ phụ thuộc và có phạm vi sửa tách biệt có thể chạy song song trên các worktree riêng. Orchestrator tích hợp commit thành một candidate để chạy gate và review. Quyền quyết định, quy trình xử lý bất đồng và mức model theo độ khó được mô tả trong [hợp đồng điều phối task](agents/task-coordination.md).
 
-Host giao task, chọn model và duy trì sổ task trong `.storyflow/<id>/tasks.md`. CLI quản lý revision, phạm vi và verdict ở cấp story. Khi đổi phiên, orchestrator đọc sổ task cùng trạng thái CLI để tiếp tục.
+Host giao task và chọn model. Task DAG/journal trong Rust quản lý readiness và kết quả task; Markdown là bản xuất để đọc. Scheduler tùy chọn qua `storyflow-tasks configure` bổ sung dispatch attempts, lease/heartbeat, retry có giới hạn, cancel và phục hồi sau restart. `storyflow-tasks status` trả danh sách có thể dispatch và blocker dạng JSON. Host khởi chạy worker, xác nhận worker đã dừng và cấp worktree riêng; lease hết hạn không tự chứng minh worker đã dừng. Xem [task DAG](docs/task-dag.md) và [scheduler/CLI workflow](docs/task-scheduler.md).
 
 ## Bàn giao context
 
