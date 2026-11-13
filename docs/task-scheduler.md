@@ -26,7 +26,7 @@ storyflow-tasks retry ID REV TASK TASK_REV REASON
 | `heartbeat` | The exact `LeaseToken` from dispatch; returns status. Extends an unexpired lease without changing the running task revision. |
 | `finish` | An `AttemptResult` containing the token, `WorkerResult` and `worker_stopped: true`; returns status. |
 | `cancel` | An unfinished task and bounded reason; records terminal `cancelled` and returns status. It does not stop its worker. |
-| `recover` | Records expired leases as blocked attempts/tasks and returns status. It never redispatches workers. |
+| `recover` | Records expired attempts, blocks their current running tasks and returns status. It never redispatches workers. |
 | `stopped` | Exact recorded token and a bounded reason after the host confirms termination; fences that attempt, releases its occupancy and returns status. |
 | `retry` | A failed/blocked task, its latest revision and reason; returns a fresh ready `TaskPacket` when the attempt budget and termination checks pass. Dispatch remains a separate operation. |
 
