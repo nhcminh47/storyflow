@@ -23,7 +23,20 @@ pub fn root() -> Result<PathBuf> {
 }
 
 pub fn git(root: &Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = Command::new(storyflow::security::process::git_executable());
+    storyflow::security::process::configure_environment(&mut command);
+    command.args([
+        "--no-pager",
+        "--no-lazy-fetch",
+        "-c",
+        if cfg!(windows) {
+            "core.hooksPath=NUL"
+        } else {
+            "core.hooksPath=/dev/null"
+        },
+        "-c",
+        "core.fsmonitor=false",
+    ]);
     for (key, _) in std::env::vars_os() {
         if key
             .to_string_lossy()
@@ -34,6 +47,13 @@ pub fn git(root: &Path) -> Command {
         }
     }
     command.current_dir(root).env("GIT_NO_REPLACE_OBJECTS", "1");
+    command.env("GIT_CONFIG_NOSYSTEM", "1").env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
     if cfg!(windows) {
         command.args(["-c", "core.longpaths=true"]);
     }
@@ -238,4 +258,28 @@ pub fn under(path: &str, prefix: &str) -> bool {
         || path
             .strip_prefix(prefix)
             .is_some_and(|tail| tail.starts_with('/'))
+}
+
+/// Pinned leaf boundaries used by managed operations; never follow Gitlinks.
+#[allow(dead_code)] // Shared-source helper used by the managed runtime companion.
+pub fn managed_tree_boundaries(
+    root: &Path,
+    base: &str,
+) -> Result<Vec<storyflow::security::TreeBoundary>> {
+    let bytes = checked(git(root).args(["ls-tree", "-r", "-z", base]).output()?)?;
+    let mut boundaries = Vec::new();
+    for entry in bytes.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or("invalid_tree_entry")?;
+        let header = std::str::from_utf8(&entry[..tab])?;
+        let mode = header.split(' ').next().ok_or("invalid_tree_entry")?;
+        let path = std::str::from_utf8(&entry[tab + 1..])?.to_owned();
+        boundaries.push(storyflow::security::TreeBoundary {
+            path,
+            regular: matches!(mode, "100644" | "100755"),
+        });
+    }
+    Ok(boundaries)
 }

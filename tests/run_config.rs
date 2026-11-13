@@ -70,9 +70,9 @@ impl Fixture {
             json!({"version":2,"scope":"repo", "agents":[
                 {"id":"implementer","source":"agents/implementer.md","version":"1"},
                 {"id":"reviewer","source":"agents/reviewer.md","version":"1"}],
-                "policy":{"checks":[check("repo")]}})
+                "policy":{"checks":[check("repo", &f.root.join("gate-marker"))]}})
         } else {
-            json!({"version":1,"protected":[],"checks":[check("repo")]})
+            json!({"version":1,"protected":[],"checks":[check("repo", &f.root.join("gate-marker"))]})
         };
         f.document("storyflow.json", document);
         if scoped {
@@ -80,7 +80,7 @@ impl Fixture {
                 json!({"version":2,"scope":"user", "workspaces":[f.root.join("team")],
                 "agents":[{"id":"planner","source":"planner.md","version":"1"}],
                 "models":{"high":"PRIVATE_MODEL_SENTINEL"},
-                "policy":{"protected":["future/output"],"checks":[check("user")]}}),
+                "policy":{"protected":["future/output"],"checks":[check("user", &f.root.join("gate-marker"))]}}),
             );
             fs::write(
                 f.user.join("Storyflow/planner.md"),
@@ -88,7 +88,7 @@ impl Fixture {
             )
             .unwrap();
             fs::write(f.root.join("team/storyflow.workspace.json"), serde_json::to_vec(&json!({
-                "version":2,"scope":"workspace","members":["project"],"policy":{"checks":[check("workspace")]}
+                "version":2,"scope":"workspace","members":["project"],"policy":{"checks":[check("workspace", &f.root.join("gate-marker"))]}
             })).unwrap()).unwrap();
         }
         fs::write(
@@ -147,8 +147,7 @@ impl Fixture {
         cmd.current_dir(&self.repo)
             .args(args)
             .env_remove("STORYFLOW_HOST_CONTEXT")
-            .env_remove("STORYFLOW_HOST_CONTEXT_ROOT")
-            .env("STORYFLOW_TEST_GATE_MARKER", self.root.join("gate-marker"));
+            .env_remove("STORYFLOW_HOST_CONTEXT_ROOT");
         if scoped {
             cmd.env("STORYFLOW_HOST_CONTEXT", &self.context)
                 .env("STORYFLOW_HOST_CONTEXT_ROOT", &self.root);
@@ -195,14 +194,18 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
-fn check(id: &str) -> Value {
+fn check(id: &str, marker: &std::path::Path) -> Value {
     json!({"id":id, "program":std::env::current_exe().unwrap(),
-    "args":["--exact","gate_helper","--nocapture","--skip","PRIVATE_ARGUMENT_SENTINEL"],"timeout_seconds":30})
+    "args":["--exact","gate_helper","--nocapture","--skip","PRIVATE_ARGUMENT_SENTINEL",
+        "--skip",format!("storyflow-test-gate-marker={}", marker.display())],"timeout_seconds":30})
 }
 
 #[test]
 fn gate_helper() {
-    if let Some(path) = std::env::var_os("STORYFLOW_TEST_GATE_MARKER") {
+    if let Some(path) = std::env::args().find_map(|arg| {
+        arg.strip_prefix("storyflow-test-gate-marker=")
+            .map(str::to_owned)
+    }) {
         use std::io::Write;
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -312,7 +315,7 @@ fn mandatory_check_and_tool_expansion_conflicts_fail_before_init() {
             f.parent(user);
             repo["tools"] = json!({"allow":["write"]});
         } else {
-            let mut inherited = check("user");
+            let mut inherited = check("user", &f.root.join("gate-marker"));
             inherited["timeout_seconds"] = json!(1);
             repo["policy"]["checks"] = json!([inherited]);
         }

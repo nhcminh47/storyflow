@@ -12,18 +12,19 @@ use std::{env, fs::File, io::Read, path::Path, process::ExitCode};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const USAGE: &str = "storyflow init ID [BASE]
+const USAGE: &str = "storyflow init ID [BASE] [--managed-runtime]
 storyflow next ID
 storyflow status ID
 storyflow submit ID REV plan|block|resume REPORT.md
 storyflow submit ID REV candidate|approve|changes REPORT.md COMMIT
-storyflow gate ID REV
+storyflow gate ID REV [--sandbox managed-only]
 storyflow audit ID
 storyflow init --scope user|workspace|repo [--path DIRECTORY]
 storyflow config inspect --effective
 storyflow config validate
 
 New runs pin effective configuration and agent contracts.
+init ID [BASE] --managed-runtime pins the managed-only worker boundary.
 STORYFLOW_HOST_CONTEXT=PATH enables explicit host-authorized User/Workspace inputs at init.
 STORYFLOW_HOST_CONTEXT_ROOT=DIR must separately authorize its external directory.
 Without it, init resolves only the pinned repository. Active runs cannot rebind configuration.";
@@ -44,23 +45,42 @@ fn run() -> Result<u8> {
         println!("{USAGE}");
         return Ok(0);
     }
-    if let Some(code) = config_cli::dispatch(&args) {
+    let managed_init = args.first().is_some_and(|s| s == "init")
+        && matches!(args.len(), 3 | 4)
+        && !args[1].starts_with('-')
+        && args.last().is_some_and(|s| s == "--managed-runtime");
+    if !managed_init && let Some(code) = config_cli::dispatch(&args) {
         return Ok(code);
     }
     let [command, id, rest @ ..] = args.as_slice() else {
         return Err(USAGE.into());
     };
     let root = repo::root()?;
-    let mut journal = Journal::open(&root, id, command == "init" && rest.len() <= 1)?;
+    let mut journal = Journal::open(
+        &root,
+        id,
+        command == "init"
+            && (rest.len() <= 1
+                || rest.last().is_some_and(|s| s == "--managed-runtime") && rest.len() <= 2),
+    )?;
     let output = match (command.as_str(), rest) {
-        ("init", [] | [_]) => {
+        ("init", [] | [_] | [_, _]) => {
             if journal.state.is_some() {
                 return Err("run already exists; use next to continue it".into());
             }
-            let base = repo::resolve(&root, rest.first().map(String::as_str).unwrap_or("HEAD"))?;
+            let managed_only = rest.last().is_some_and(|s| s == "--managed-runtime");
+            let inputs = if managed_only {
+                &rest[..rest.len() - 1]
+            } else {
+                rest
+            };
+            if inputs.len() > 1 {
+                return Err(USAGE.into());
+            }
+            let base = repo::resolve(&root, inputs.first().map(String::as_str).unwrap_or("HEAD"))?;
             repo::story(&root, &base, id)?;
             repo::spec(&root, &base, id)?;
-            let snapshot = run_config::initialize(&root, id, &base)?;
+            let snapshot = run_config::initialize(&root, id, &base, managed_only)?;
             repo::pin(&root, id, 0, &base)?;
             let config_sha256 = journal.pin_snapshot(snapshot)?;
             journal.append(Event::Init {
@@ -105,7 +125,19 @@ fn run() -> Result<u8> {
             journal.append(event)?;
             summary(&journal, id)?
         }
-        ("gate", [revision]) => {
+        ("gate", [revision, sandbox @ ..]) => {
+            let backend = match sandbox {
+                [] => storyflow::security::SandboxBackend::Trusted,
+                [flag, name] if flag == "--sandbox" && name == "managed-only" => {
+                    storyflow::security::SandboxBackend::ManagedOnly
+                }
+                _ => {
+                    return Err(
+                        "unsupported_sandbox: no supported command isolation backend requested"
+                            .into(),
+                    );
+                }
+            };
             journal.expect_revision(revision)?;
             let state = journal.state()?;
             require_stage(state, Stage::Gate)?;
@@ -140,7 +172,10 @@ fn run() -> Result<u8> {
                 &story,
                 &state.base,
                 &commit,
-                journal.snapshot.is_some(),
+                gate::GateOptions {
+                    validate_namespace: journal.snapshot.is_some(),
+                    backend,
+                },
             )?;
             let passed = checks.iter().all(CheckResult::passed);
             journal.append(Event::Gate {
@@ -210,6 +245,8 @@ fn context(root: &Path, journal: &Journal, id: &str) -> Result<Value> {
     };
     let mut packet = json!({
         "status": status, "action": "delegate", "role": role,
+        "managed_runtime": journal.snapshot.as_ref().is_some_and(|s| s.managed_only),
+        "external_host_tools_controlled": false,
         "contract": if let Some(snapshot) = &journal.snapshot {
             snapshot.require_cli_capabilities(&run_config::capabilities())?;
             snapshot.effective.agents.get(role).ok_or("pinned worker missing")?.content.clone()

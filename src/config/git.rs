@@ -13,8 +13,11 @@ pub struct GitBaseline {
 }
 
 pub(crate) fn command(root: &Path) -> Command {
-    let mut command = Command::new("git");
-    command.args(["--no-replace-objects", "-C"]).arg(root);
+    let mut command = Command::new(crate::security::process::git_executable());
+    crate::security::process::configure_environment(&mut command);
+    command
+        .args(["--no-replace-objects", "--no-lazy-fetch", "-C"])
+        .arg(root);
     // A host's unrelated Git environment must not redirect authoritative reads.
     for (key, _) in std::env::vars_os() {
         if key
@@ -26,6 +29,9 @@ pub(crate) fn command(root: &Path) -> Command {
         }
     }
     command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
     command.env("GIT_CONFIG_NOSYSTEM", "1");
     command.env(
         "GIT_CONFIG_GLOBAL",
@@ -124,12 +130,7 @@ impl GitBaseline {
     pub fn read(&self, path: &str, origin: &Origin) -> ConfigResult<Vec<u8>> {
         self.read_with_limit(path, origin, None)
     }
-    pub(crate) fn read_bounded(
-        &self,
-        path: &str,
-        origin: &Origin,
-        limit: usize,
-    ) -> ConfigResult<Vec<u8>> {
+    pub fn read_bounded(&self, path: &str, origin: &Origin, limit: usize) -> ConfigResult<Vec<u8>> {
         self.read_with_limit(path, origin, Some(limit))
     }
     fn read_with_limit(
