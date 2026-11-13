@@ -365,12 +365,35 @@ fn task_blockers(
             None,
         ));
     }
-    if task.status != TaskStatus::Ready {
+    if task.status == TaskStatus::Pending {
+        let mut prerequisites: Vec<_> = task.spec.prerequisites.iter().collect();
+        prerequisites.sort_unstable();
+        for dependency in prerequisites {
+            let (code, detail) = match view.tasks[dependency].status {
+                TaskStatus::Succeeded => continue,
+                TaskStatus::Pending | TaskStatus::Ready | TaskStatus::Running => (
+                    "dependency_pending",
+                    "prerequisite has not completed successfully",
+                ),
+                TaskStatus::Failed => (
+                    "dependency_failed",
+                    "prerequisite failed; retry is required",
+                ),
+                TaskStatus::Blocked => (
+                    "dependency_blocked",
+                    "prerequisite is blocked; resolve it before retrying",
+                ),
+                TaskStatus::Cancelled => (
+                    "dependency_cancelled",
+                    "prerequisite was terminally cancelled in this graph",
+                ),
+            };
+            let mut reason = blocker(code, &format!("{dependency}: {detail}"), None);
+            reason.dependency = Some(dependency.clone());
+            blockers.push(reason);
+        }
+    } else if task.status != TaskStatus::Ready {
         let (code, detail) = match task.status {
-            TaskStatus::Pending => (
-                "dependencies_pending",
-                "successful prerequisite results are required",
-            ),
             TaskStatus::Running => (
                 "task_running",
                 "wait for result or explicitly stop/recover this worker",
@@ -381,7 +404,7 @@ fn task_blockers(
                 "explicit retry is required after all workers stop",
             ),
             TaskStatus::Cancelled => ("task_cancelled", "cancellation is terminal for this graph"),
-            TaskStatus::Ready => unreachable!(),
+            TaskStatus::Pending | TaskStatus::Ready => unreachable!(),
         };
         blockers.push(blocker(code, detail, None));
     }
