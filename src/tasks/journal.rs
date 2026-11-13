@@ -1,4 +1,8 @@
 use super::model::*;
+use super::scheduler::{
+    self, AttemptPhase, AttemptResult, Clock, DispatchPacket, LeaseToken, SchedulerEvent,
+    SchedulerPolicy, SchedulerStatus,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,6 +39,7 @@ pub struct TaskJournal {
     last: Option<String>,
     events: usize,
     bytes: usize,
+    graph_revision: u64,
     _lock: File,
 }
 impl TaskJournal {
@@ -68,6 +73,7 @@ impl TaskJournal {
             last: None,
             events: 0,
             bytes: 0,
+            graph_revision: 0,
             _lock: lock,
         };
         let mut entries = fs::read_dir(journal.dir.join("events"))?
@@ -116,7 +122,18 @@ impl TaskJournal {
                 "task_integrity",
                 "task journal must begin with graph definition",
             )?;
-            apply(&mut journal.view, &journal.context, &record.body.event)?;
+            if matches!(
+                record.body.event,
+                TaskEvent::Define { .. } | TaskEvent::Replace { .. }
+            ) {
+                journal.graph_revision = record.body.revision;
+            }
+            apply(
+                &mut journal.view,
+                &journal.context,
+                &record.body.event,
+                journal.graph_revision,
+            )?;
             journal.view.revision = Some(record.body.revision);
             journal.events += 1;
             journal.last = Some(record.sha256);
@@ -181,6 +198,156 @@ impl TaskJournal {
         self.view.packet(task)
     }
 
+    /// Opt in once. Existing legacy running tasks must finish first; after this
+    /// event legacy start/complete cannot bypass lease and concurrency checks.
+    pub fn configure_scheduler(
+        &mut self,
+        revision: u64,
+        policy: SchedulerPolicy,
+        clock: &impl Clock,
+    ) -> TaskResult<()> {
+        self.expect_revision(revision)?;
+        self.append(TaskEvent::Scheduler {
+            event: SchedulerEvent::Configure {
+                policy,
+                at_ms: clock.now_ms(),
+            },
+        })
+    }
+
+    pub fn scheduler_status(&self, clock: &impl Clock) -> TaskResult<SchedulerStatus> {
+        scheduler::status(&self.view, clock.now_ms(), self.require_live().is_ok())
+    }
+
+    /// Reserves capacity and publishes a packet. The host must actually start
+    /// the provider worker and deduplicate launches by the returned attempt ID.
+    pub fn dispatch(
+        &mut self,
+        revision: u64,
+        task: &str,
+        task_revision: u64,
+        owner: &str,
+        clock: &impl Clock,
+    ) -> TaskResult<DispatchPacket> {
+        self.expect_revision(revision)?;
+        self.append(TaskEvent::Scheduler {
+            event: SchedulerEvent::Dispatch {
+                task: task.into(),
+                task_revision,
+                owner: owner.into(),
+                at_ms: clock.now_ms(),
+            },
+        })?;
+        scheduler::dispatch_packet(&self.view, task)
+    }
+
+    pub fn heartbeat(
+        &mut self,
+        revision: u64,
+        token: &LeaseToken,
+        clock: &impl Clock,
+    ) -> TaskResult<()> {
+        self.expect_revision(revision)?;
+        self.append(TaskEvent::Scheduler {
+            event: SchedulerEvent::Heartbeat {
+                lease: token.clone(),
+                at_ms: clock.now_ms(),
+            },
+        })
+    }
+
+    pub fn complete_attempt(
+        &mut self,
+        revision: u64,
+        result: AttemptResult,
+        clock: &impl Clock,
+    ) -> TaskResult<()> {
+        self.expect_revision(revision)?;
+        self.append(TaskEvent::Scheduler {
+            event: SchedulerEvent::Complete {
+                result,
+                at_ms: clock.now_ms(),
+            },
+        })
+    }
+
+    pub fn cancel_task(
+        &mut self,
+        revision: u64,
+        task: &str,
+        task_revision: u64,
+        reason: &str,
+        clock: &impl Clock,
+    ) -> TaskResult<()> {
+        self.expect_revision(revision)?;
+        self.append(TaskEvent::Scheduler {
+            event: SchedulerEvent::Cancel {
+                task: task.into(),
+                task_revision,
+                reason: reason.into(),
+                at_ms: clock.now_ms(),
+            },
+        })
+    }
+
+    /// Explicit expiry policy: fence and block expired attempts. Never infer
+    /// worker exit, free capacity, or dispatch a replacement automatically.
+    pub fn recover_expired(&mut self, revision: u64, clock: &impl Clock) -> TaskResult<()> {
+        self.expect_revision(revision)?;
+        let now = clock.now_ms();
+        let scheduler = scheduler::configured(&self.view)?;
+        scheduler::check_time(scheduler, now)?;
+        if !scheduler
+            .attempts
+            .values()
+            .any(|a| a.phase == AttemptPhase::Leased && !a.worker_stopped && now >= a.expires_at_ms)
+        {
+            return Ok(());
+        }
+        self.append(TaskEvent::Scheduler {
+            event: SchedulerEvent::Recover { at_ms: now },
+        })
+    }
+
+    /// Cleanup is allowed even after the parent changes, blocks, or finishes.
+    /// This records a host assertion of exit; it cannot apply worker results.
+    pub fn confirm_stopped(
+        &mut self,
+        revision: u64,
+        token: &LeaseToken,
+        reason: &str,
+        clock: &impl Clock,
+    ) -> TaskResult<()> {
+        self.expect_store_revision(revision)?;
+        self.append(TaskEvent::Scheduler {
+            event: SchedulerEvent::Stopped {
+                lease: token.clone(),
+                reason: reason.into(),
+                at_ms: clock.now_ms(),
+            },
+        })
+    }
+
+    pub fn retry_task(
+        &mut self,
+        revision: u64,
+        task: &str,
+        task_revision: u64,
+        reason: &str,
+        clock: &impl Clock,
+    ) -> TaskResult<TaskPacket> {
+        self.expect_revision(revision)?;
+        self.append(TaskEvent::Scheduler {
+            event: SchedulerEvent::Retry {
+                task: task.into(),
+                task_revision,
+                reason: reason.into(),
+                at_ms: clock.now_ms(),
+            },
+        })?;
+        self.view.packet(task)
+    }
+
     fn require_live(&self) -> TaskResult<()> {
         require(
             !self.context.blocked
@@ -209,7 +376,13 @@ impl TaskJournal {
             "task event limit reached",
         )?;
         let mut next = self.view.clone();
-        apply(&mut next, &self.context, &event)?;
+        let graph_revision =
+            if matches!(event, TaskEvent::Define { .. } | TaskEvent::Replace { .. }) {
+                self.events as u64
+            } else {
+                self.graph_revision
+            };
+        apply(&mut next, &self.context, &event, graph_revision)?;
         let body = Body {
             schema: SCHEMA,
             revision: self.events as u64,
@@ -247,6 +420,7 @@ impl TaskJournal {
         self.last = Some(record.sha256);
         self.events += 1;
         self.bytes += bytes.len();
+        self.graph_revision = graph_revision;
         Ok(())
     }
     fn event_path(&self, revision: usize) -> PathBuf {
