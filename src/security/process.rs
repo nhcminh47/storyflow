@@ -28,12 +28,33 @@ pub struct ProcessResult {
 }
 
 /// Deliberately excludes HOME, credential variables, loader hooks, Git overrides,
-/// language startup hooks and all caller-provided tool configuration variables.
+/// language startup hooks and unlisted caller-provided tool configuration variables.
 /// PATH remains a trusted host input so existing gate program names resolve.
 pub fn configure_environment(command: &mut Command) {
     let mut allowed = vec!["PATH", "TEMP", "TMP", "TMPDIR"];
     if cfg!(windows) {
-        allowed.extend(["SystemRoot", "WINDIR", "ComSpec", "PATHEXT"]);
+        // Non-secret locations required by MSVC/vswhere discovery and developer
+        // command prompts. Credentials and compiler flag injection stay absent.
+        allowed.extend([
+            "SystemRoot",
+            "WINDIR",
+            "ComSpec",
+            "PATHEXT",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "VSINSTALLDIR",
+            "VCINSTALLDIR",
+            "VCToolsInstallDir",
+            "VCToolsVersion",
+            "WindowsSdkDir",
+            "WindowsSDKVersion",
+            "LIB",
+            "LIBPATH",
+            "INCLUDE",
+            "VSCMD_ARG_TGT_ARCH",
+            "VSCMD_ARG_VCVARS_SPECTRE",
+        ]);
     }
     let values: Vec<_> = allowed
         .into_iter()

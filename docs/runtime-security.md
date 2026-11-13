@@ -124,9 +124,13 @@ trusted commands. Candidate identity, check outcomes, timeout blocking, revision
 log references and audit semantics remain intact. A timeout cannot pass.
 
 The process runner clears the environment, retaining only `PATH`, `TEMP`, `TMP`, `TMPDIR` and, on Windows,
-`SystemRoot`, `WINDIR`, `ComSpec`, `PATHEXT`; it sets `TZ=UTC`, `LC_ALL=C`. PATH and
+`SystemRoot`, `WINDIR`, `ComSpec`, `PATHEXT` and the explicit MSVC location profile
+(`ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432`, `VSINSTALLDIR`, `VCINSTALLDIR`,
+`VCToolsInstallDir`, `VCToolsVersion`, `WindowsSdkDir`, `WindowsSDKVersion`,
+`LIB`, `LIBPATH`, `INCLUDE`, `VSCMD_ARG_TGT_ARCH`, `VSCMD_ARG_VCVARS_SPECTRE`).
+It sets `TZ=UTC`, `LC_ALL=C`. PATH and
 the OS/toolchain installation are trusted host inputs. HOME, API keys, Git redirects,
-loader hooks, language startup hooks and caller tool settings are not inherited.
+loader hooks, language startup hooks and unlisted caller tool settings are not inherited.
 Git authority reads additionally disable global/system configuration, replacement
 objects and implicit lazy fetching; Git must support `--no-lazy-fetch` (older
 versions fail closed). Bare executables resolve only through absolute trusted PATH
@@ -198,3 +202,20 @@ environment policy are preserved. No other ownership exceptions were requested.
 Primary API references: [Windows CreateFileW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew),
 [Linux openat](https://man7.org/linux/man-pages/man2/openat.2.html),
 [Git environment and no-lazy-fetch](https://git-scm.com/docs/git).
+Windows MSVC discovery is validated by the CI slug demo; retaining Program Files
+locations is required for vswhere, as described in the
+[Microsoft installer documentation](https://github.com/microsoft/vswhere/wiki/Installing)
+and [Rust MSVC discovery source](https://github.com/rust-lang/cc-rs/blob/main/find-msvc-tools/src/find_tools.rs).
+## Contract Change Request CCR-9-2 (pending)
+
+Ubuntu CI attempts 1 and 2 encountered `task_locked` after dropping and immediately
+reopening the unchanged TaskJournal, in separate existing DAG/scheduler tests.
+Rust's File lock is retained by inherited descriptors until every copy closes;
+an unrelated parallel fork can temporarily retain it before exec. A standalone
+WSL fork/flock experiment reproduced this exact behavior. The proposed narrow fix
+is an explicit `_lock.unlock()` in `TaskJournal::drop`, plus a deterministic Linux
+fork-inheritance regression. No state, event, attempt identity or schema changes.
+
+The scheduler-owned file remains untouched pending the invoking user's ownership
+exception. Preserve the failed CI evidence; do not relax lock checks or retry tests
+until green. This blocks full Linux G6 validation until addressed.
