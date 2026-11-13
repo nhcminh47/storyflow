@@ -1,6 +1,6 @@
 # Scoped configuration, version 2
 
-User, Workspace and Repo are configuration scopes. A story run is the execution scope. The Rust resolver implements this specification. New CLI runs pin resolved inputs, using repository-only mode by default or explicit invoking-host trust for external scopes; see [run snapshots](run-snapshots.md). References to the original v0.1 CLI below describe historical binaries and pre-snapshot run compatibility. Scope bootstrap/inspect/validate commands remain proposed.
+User, Workspace and Repo are configuration scopes. A story run is the execution scope. The Rust resolver implements this specification. New CLI runs pin resolved inputs, using repository-only mode by default or explicit invoking-host trust for external scopes; see [run snapshots](run-snapshots.md). References to the original v0.1 CLI below describe historical binaries and pre-snapshot run compatibility. Scope bootstrap/inspect/validate commands are implemented; see [configuration CLI](config-cli.md) for HEAD-based reads, skeletons and redaction.
 
 ## Compatibility and migration
 
@@ -56,7 +56,7 @@ The [schema-1 run snapshot](run-snapshots.md) now implements initialization/repl
 
 ## Command grammar
 
-`storyflow init ID [BASE]` initializes a story run against the approved Git baseline. The proposed `storyflow init --scope user|workspace|repo [--path PATH]` bootstraps a configuration file without initializing a run or overwriting an existing file. The forms are mutually exclusive. Bootstrapping a workspace writes its marker. Registration and authorization are separate steps.
+`storyflow init ID [BASE]` initializes a story run against the approved Git baseline. The implemented `storyflow init --scope user|workspace|repo [--path DIRECTORY]` bootstraps a configuration file without initializing a run or overwriting an existing file. The forms are mutually exclusive. Bootstrapping a workspace writes its marker. Registration and authorization are separate steps.
 
 ## Specification validation
 

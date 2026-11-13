@@ -6,7 +6,7 @@ Framework điều phối agent cho software project. Mỗi lần chạy giao m�
 
 Storyflow hướng tới một bộ agent có thể tái sử dụng ở **User → Workspace → Repository**, trong khi đơn vị thực thi nhỏ nhất vẫn là **một user story trong một Git worktree**. Ba scope dùng để **phân phối cấu hình và context**, không tạo ra ba state machine độc lập.
 
-> **Trạng thái triển khai:** Rust resolver và snapshot cấu hình theo run đã có. `storyflow init ID [BASE]` mặc định resolve repository từ Git baseline; User/Workspace chỉ được bật qua trust input tường minh của host (`STORYFLOW_HOST_CONTEXT` và thư mục được cho phép riêng qua `STORYFLOW_HOST_CONTEXT_ROOT`, đều ngoài Git checkout). Run mới pin policy, provenance và toàn bộ agent contract; resume không đọc lại scope cha. CLI bootstrap/inspect/validate và điều phối đa repo bên dưới vẫn là đề xuất. Xem [run snapshots](docs/run-snapshots.md) về trust, giới hạn quyền và tương thích run cũ. `init ID [BASE]` vẫn là khởi tạo story run.
+> **Trạng thái triển khai:** Rust resolver và snapshot cấu hình theo run đã có. `storyflow init ID [BASE]` mặc định resolve repository từ Git baseline; User/Workspace chỉ được bật qua trust input tường minh của host (`STORYFLOW_HOST_CONTEXT` và thư mục được cho phép riêng qua `STORYFLOW_HOST_CONTEXT_ROOT`, đều ngoài Git checkout). Run mới pin policy, provenance và toàn bộ agent contract; resume không đọc lại scope cha. CLI bootstrap/inspect/validate đã có; điều phối đa repo vẫn là đề xuất. Xem [configuration CLI](docs/config-cli.md) về skeleton, HEAD và redaction. Xem [run snapshots](docs/run-snapshots.md) về trust, giới hạn quyền và tương thích run cũ. `init ID [BASE]` vẫn là khởi tạo story run.
 
 ### Phân chia trách nhiệm
 
@@ -37,7 +37,7 @@ product-workspace/
 
 Workspace Orchestrator (dự kiến) có thể phối hợp các story phụ thuộc nhau giữa nhiều repo. Tuy nhiên, **mỗi repo vẫn có story run, baseline, candidate, gate và audit riêng**. Không có một commit hay quality verdict dùng chung thay cho gate của từng repo.
 
-### Khởi tạo và kiểm tra scope (CLI đề xuất — chưa implement)
+### Khởi tạo và kiểm tra scope
 
 ```sh
 # Bootstrap cấu hình; khác với lệnh init story run hiện tại
@@ -71,13 +71,13 @@ Policy / trust validation
 Effective config → snapshot + hash tại lúc tạo story run
 ```
 
-- **Thông số thông thường** (ví dụ model tier hoặc conventions): repo được ưu tiên hơn workspace, workspace được ưu tiên hơn user, nhưng chỉ với key được phép override. `inspect --effective` cần chỉ rõ giá trị và provenance của từng key.
+- **Thông số thông thường** (ví dụ model tier hoặc conventions): repo được ưu tiên hơn workspace, workspace được ưu tiên hơn user, nhưng chỉ với key được phép override. `inspect --effective` hiển thị giá trị và provenance không nhạy cảm; redact model hints, command programs/arguments và agent content.
 - **Agent Markdown**: resolve theo role/ID như **một contract hoàn chỉnh**, không nối nội dung nhiều file `.md`. Nếu sau này hỗ trợ `extends`, cần version, source và quy tắc conflict tường minh. Những agent contract được chọn phải được xác nhận trước khi dispatch.
 - **An toàn**: tập `protected` và mandatory quality gates chỉ được **giữ nguyên hoặc siết chặt**; quyền/tool access được lấy theo tập quyền hợp lệ giao nhau, không tự mở rộng từ repo. Cấu hình ngoài repo không được ngầm nâng quyền hoặc thay thế gate mà không có sự chấp thuận. Secrets nằm trong secure store hoặc environment được quản lý, không đưa vào Markdown, journal hay repo.
 - **Reproducibility**: resolve một lần khi bắt đầu run rồi snapshot/hash phiên bản config và agent contracts đã áp dụng. Một thay đổi user/workspace config sau đó **không được âm thầm đổi** policy của run đang chạy. Repo baseline pinning hiện có vẫn phải được duy trì.
 - **Failure mode**: thiếu scope, config conflict, agent không tương thích hoặc policy yếu hơn mức bắt buộc phải trả lỗi có thể giải thích được (**fail-closed**), không tự fallback sang contract lỏng hơn.
 
-Resolver, policy composition và snapshot đã được tích hợp vào run mới; giao thức state/revision và grammar story hiện có được giữ nguyên. CLI bootstrap và inspect/validate vẫn chưa implement. Run cũ không tự migrate; rebind cấu hình của run đang chạy chưa được hỗ trợ.
+Resolver, policy composition và snapshot đã được tích hợp vào run mới; giao thức state/revision và grammar story hiện có được giữ nguyên. CLI bootstrap tạo skeleton không ghi đè; inspect/validate resolve HEAD đã commit, không chạy gate hay đổi run. Model hints, command programs/arguments và agent content được redact; repo skeleton cần agent và mandatory check đã duyệt trước khi dùng. Run cũ không tự migrate; rebind cấu hình của run đang chạy chưa được hỗ trợ.
 
 ## Chạy ví dụ
 

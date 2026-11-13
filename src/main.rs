@@ -1,3 +1,4 @@
+mod config_cli;
 mod gate;
 mod journal;
 mod model;
@@ -11,13 +12,16 @@ use std::{env, fs::File, io::Read, path::Path, process::ExitCode};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const USAGE: &str = "+storyflow init ID [BASE]
+const USAGE: &str = "storyflow init ID [BASE]
 storyflow next ID
 storyflow status ID
 storyflow submit ID REV plan|block|resume REPORT.md
 storyflow submit ID REV candidate|approve|changes REPORT.md COMMIT
 storyflow gate ID REV
 storyflow audit ID
+storyflow init --scope user|workspace|repo [--path DIRECTORY]
+storyflow config inspect --effective
+storyflow config validate
 
 New runs pin effective configuration and agent contracts.
 STORYFLOW_HOST_CONTEXT=PATH enables explicit host-authorized User/Workspace inputs at init.
@@ -39,6 +43,9 @@ fn run() -> Result<u8> {
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h" | "help") {
         println!("{USAGE}");
         return Ok(0);
+    }
+    if let Some(code) = config_cli::dispatch(&args) {
+        return Ok(code);
     }
     let [command, id, rest @ ..] = args.as_slice() else {
         return Err(USAGE.into());
