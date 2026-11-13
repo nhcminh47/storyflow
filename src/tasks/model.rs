@@ -440,6 +440,7 @@ impl TaskView {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskEvent {
     Define { graph: TaskGraph },
+    Replace { graph: TaskGraph },
     Start { task: String, task_revision: u64 },
     Complete { result: WorkerResult },
 }
@@ -450,21 +451,43 @@ pub(crate) fn apply(
     event: &TaskEvent,
 ) -> TaskResult<()> {
     match event {
-        TaskEvent::Define { graph } => {
-            require(
-                view.revision.is_none(),
-                "task_already_initialized",
-                "graph is immutable",
-            )?;
+        TaskEvent::Define { graph } | TaskEvent::Replace { graph } => {
+            let task_revision = if matches!(event, TaskEvent::Define { .. }) {
+                require(
+                    view.revision.is_none(),
+                    "task_already_initialized",
+                    "graph is immutable within a story revision",
+                )?;
+                0
+            } else {
+                let revision = view.revision.ok_or_else(|| {
+                    error("task_uninitialized", "initialize the task graph first")
+                })?;
+                require(
+                    graph.story_revision > view.story_revision,
+                    "stale_story_context",
+                    "replacement graph requires a newer story revision",
+                )?;
+                // Every earlier task revision is at most the previous ledger
+                // revision. Seeding from the replacement event prevents an old
+                // result matching a reused task ID even with a fresh store REV.
+                revision + 1
+            };
             graph.validate(context)?;
+            require(
+                graph.story_revision <= context.story_revision && graph.stage != TaskStage::Done,
+                "stale_story_context",
+                "graph cannot bind a future revision or completed stage",
+            )?;
             view.story_revision = graph.story_revision;
             view.stage = graph.stage;
+            view.tasks.clear();
             for spec in &graph.tasks {
                 view.tasks.insert(
                     spec.id.clone(),
                     TaskState {
                         spec: spec.clone(),
-                        revision: 0,
+                        revision: task_revision,
                         status: TaskStatus::Pending,
                         result: None,
                     },

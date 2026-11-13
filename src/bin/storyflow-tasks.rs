@@ -15,7 +15,7 @@ use std::{env, process::ExitCode};
 use storyflow::tasks::*;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const USAGE: &str = "storyflow-tasks init ID GRAPH.json\nstoryflow-tasks view ID [--markdown]\nstoryflow-tasks packet ID TASK\nstoryflow-tasks start ID REV TASK TASK_REV\nstoryflow-tasks complete ID REV RESULT.json\n\nTask bookkeeping only: never launches a worker or approves a story.\nUses an initialized story's pinned base, scope, stage and current revision.\nJSON output; success 0, rejected/operational error 2. No-task view is additive.";
+const USAGE: &str = "storyflow-tasks init ID GRAPH.json\nstoryflow-tasks replace ID REV GRAPH.json\nstoryflow-tasks view ID [--markdown]\nstoryflow-tasks packet ID TASK\nstoryflow-tasks start ID REV TASK TASK_REV\nstoryflow-tasks complete ID REV RESULT.json\n\nTask bookkeeping only: never launches a worker or approves a story.\nUses an initialized story's pinned base, scope, stage and current revision.\nReplace explicitly publishes a new graph after the story revision changes.\nJSON output; success 0, rejected/operational error 2. No-task view is additive.";
 
 fn main() -> ExitCode {
     match run() {
@@ -39,6 +39,7 @@ fn run() -> Result<()> {
     if !matches!(
         (command.as_str(), rest),
         ("init", [_])
+            | ("replace", [_, _])
             | ("view", [])
             | ("view", [..])
             | ("packet", [_])
@@ -85,6 +86,13 @@ fn run() -> Result<()> {
             tasks.initialize(serde_json::from_slice(&read_document(
                 std::path::Path::new(path),
             )?)?)?;
+            serde_json::to_value(tasks.view())?
+        }
+        ("replace", [revision, path]) => {
+            tasks.replace(
+                revision.parse()?,
+                serde_json::from_slice(&read_document(std::path::Path::new(path))?)?,
+            )?;
             serde_json::to_value(tasks.view())?
         }
         ("view", []) => serde_json::to_value(tasks.view())?,

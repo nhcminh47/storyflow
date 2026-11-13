@@ -134,14 +134,27 @@ impl TaskJournal {
             "task_already_initialized",
             "task graph already exists",
         )?;
+        self.require_current_graph(&graph)?;
+        self.append(TaskEvent::Define { graph })
+    }
+
+    /// Publish a fresh graph after a story transition, retaining the old events.
+    /// The ledger revision and task revisions never reset across replacements.
+    pub fn replace(&mut self, revision: u64, graph: TaskGraph) -> TaskResult<()> {
+        self.expect_store_revision(revision)?;
+        self.require_current_graph(&graph)?;
+        self.append(TaskEvent::Replace { graph })
+    }
+
+    fn require_current_graph(&self, graph: &TaskGraph) -> TaskResult<()> {
         require(
             !self.context.blocked
+                && self.context.stage != TaskStage::Done
                 && graph.story_revision == self.context.story_revision
                 && graph.stage == self.context.stage,
             "stale_story_context",
-            "graph must bind the current unblocked story revision/stage",
-        )?;
-        self.append(TaskEvent::Define { graph })
+            "graph must bind the current unblocked, unfinished story revision/stage",
+        )
     }
 
     pub fn start(
@@ -171,6 +184,7 @@ impl TaskJournal {
     fn require_live(&self) -> TaskResult<()> {
         require(
             !self.context.blocked
+                && self.context.stage != TaskStage::Done
                 && self.view.story_revision == self.context.story_revision
                 && self.view.stage == self.context.stage,
             "stale_story_context",
@@ -179,6 +193,9 @@ impl TaskJournal {
     }
     fn expect_revision(&self, revision: u64) -> TaskResult<()> {
         self.require_live()?;
+        self.expect_store_revision(revision)
+    }
+    fn expect_store_revision(&self, revision: u64) -> TaskResult<()> {
         require(
             self.view.revision == Some(revision),
             "stale_task_store_revision",
@@ -223,7 +240,8 @@ impl TaskJournal {
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
-        fs::rename(pending, path)?;
+        fs::rename(pending, &path)?;
+        sync_parent(&path)?;
         next.revision = Some(record.body.revision);
         self.view = next;
         self.last = Some(record.sha256);
@@ -253,10 +271,17 @@ fn checksum(body: &Body) -> TaskResult<String> {
 }
 fn create_dir(path: &Path) -> TaskResult<()> {
     match fs::create_dir(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_parent(path),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => regular_dir(path),
         Err(e) => Err(e.into()),
     }
+}
+fn sync_parent(path: &Path) -> TaskResult<()> {
+    #[cfg(unix)]
+    File::open(path.parent().expect("task storage has a parent"))?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 fn regular_dir(path: &Path) -> TaskResult<()> {
     let metadata = fs::symlink_metadata(path)?;

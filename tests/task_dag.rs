@@ -230,6 +230,104 @@ fn empty_task_state_is_additive_and_immutable_graph_has_exact_parent_binding() {
     code(j.initialize(g), "stale_story_context");
     j.initialize(graph()).unwrap();
     code(j.initialize(graph()), "task_already_initialized");
+    code(j.replace(0, graph()), "stale_story_context");
+}
+
+#[test]
+fn replacement_retains_history_and_rejects_old_results_even_with_current_store_revision() {
+    let f = Fixture::new();
+    let mut j = f.open();
+    j.initialize(graph()).unwrap();
+    j.start(0, "a", 0).unwrap();
+    j.complete(1, result("a", ResultStatus::Succeeded)).unwrap();
+    let history: Vec<_> = (0..=2)
+        .map(|r| fs::read(f.events().join(format!("{r:012}.json"))).unwrap())
+        .collect();
+    drop(j);
+
+    let mut context = f.context.clone();
+    context.story_revision = 1;
+    context.stage = TaskStage::Implement;
+    let mut g = graph();
+    g.story_revision = 1;
+    g.stage = TaskStage::Implement;
+    for task in &mut g.tasks {
+        task.stage = g.stage;
+    }
+    let mut j = TaskJournal::open(&f.root, context.clone()).unwrap();
+    code(j.replace(1, g.clone()), "stale_task_store_revision");
+    code(j.replace(2, graph()), "stale_story_context");
+    let mut bad = g.clone();
+    bad.base = "2".repeat(40);
+    code(j.replace(2, bad), "task_identity");
+    let mut bad = g.clone();
+    bad.tasks[0].write_scope = vec!["outside".into()];
+    code(j.replace(2, bad), "task_scope");
+    assert_eq!(j.view().revision, Some(2));
+    assert_eq!(fs::read_dir(f.events()).unwrap().count(), 3);
+
+    j.replace(2, g.clone()).unwrap();
+    assert_eq!(j.view().revision, Some(3));
+    assert_eq!(j.view().ready, ["a", "b"]);
+    assert_eq!(j.view().tasks["c"].status, TaskStatus::Pending);
+    assert!(j.view().tasks.values().all(|t| t.result.is_none()));
+    code(j.replace(3, g), "stale_story_context");
+    let packet = j.start(3, "a", 3).unwrap();
+    assert_eq!(packet.story_revision, 1);
+    assert_eq!(packet.task.revision, 4);
+    code(
+        j.complete(1, result("a", ResultStatus::Succeeded)),
+        "stale_task_store_revision",
+    );
+    code(
+        j.complete(4, result("a", ResultStatus::Succeeded)),
+        "stale_task_revision",
+    );
+    let mut fresh = result("a", ResultStatus::Succeeded);
+    fresh.task_revision = packet.task.revision;
+    j.complete(4, fresh).unwrap();
+    assert_eq!(j.view().ready, ["b"]);
+    let view = j.view().clone();
+    drop(j);
+    let j = TaskJournal::open(&f.root, context).unwrap();
+    assert_eq!(j.view(), &view);
+    assert_eq!(j.view().markdown(), view.markdown());
+    for (r, bytes) in history.iter().enumerate() {
+        assert_eq!(
+            &fs::read(f.events().join(format!("{r:012}.json"))).unwrap(),
+            bytes
+        );
+    }
+    drop(j);
+    code(
+        TaskJournal::open(&f.root, f.context.clone()),
+        "stale_story_context",
+    );
+}
+
+#[test]
+fn blocked_and_done_contexts_allow_views_but_refuse_dispatch_and_graph_changes() {
+    let f = Fixture::new();
+    let mut j = f.open();
+    code(j.replace(0, graph()), "stale_task_store_revision");
+    j.initialize(graph()).unwrap();
+    let view = j.view().clone();
+    drop(j);
+    for (stage, blocked) in [(TaskStage::Plan, true), (TaskStage::Done, false)] {
+        let mut context = f.context.clone();
+        context.stage = stage;
+        context.blocked = blocked;
+        let mut j = TaskJournal::open(&f.root, context).unwrap();
+        assert_eq!(j.view(), &view);
+        code(j.packet("a"), "stale_story_context");
+        code(j.start(0, "a", 0), "stale_story_context");
+        code(
+            j.complete(0, result("a", ResultStatus::Succeeded)),
+            "stale_story_context",
+        );
+        code(j.replace(0, graph()), "stale_story_context");
+    }
+    assert_eq!(fs::read_dir(f.events()).unwrap().count(), 1);
 }
 
 #[test]
@@ -377,8 +475,16 @@ impl CliFixture {
         Self { f, base }
     }
     fn graph_file(&self) -> PathBuf {
+        self.graph_file_at(0, TaskStage::Plan)
+    }
+    fn graph_file_at(&self, story_revision: u64, stage: TaskStage) -> PathBuf {
         let mut g = graph();
         g.base = self.base.clone();
+        g.story_revision = story_revision;
+        g.stage = stage;
+        for task in &mut g.tasks {
+            task.stage = stage;
+        }
         let path = self.f.root.join("graph.json");
         fs::write(&path, serde_json::to_vec(&g).unwrap()).unwrap();
         path
@@ -508,6 +614,135 @@ fn companion_binds_story_lock_snapshot_and_live_stage_revision() {
     )
     .unwrap();
     rejected(f.tasks(&["view", "demo-001"]), "invalid_config_snapshot");
+}
+
+#[test]
+fn companion_replaces_graphs_after_plan_block_resume_and_refuses_completed_story() {
+    let f = CliFixture::new();
+    let path = f.graph_file();
+    let graph_path = path.to_str().unwrap();
+    ok(f.tasks(&["init", "demo-001", graph_path]));
+    ok(f.tasks(&["start", "demo-001", "0", "a", "0"]));
+    let result_path = f.f.root.join("result.json");
+    let result_file = result_path.to_str().unwrap();
+    let old_result = result("a", ResultStatus::Succeeded);
+    fs::write(&result_path, serde_json::to_vec(&old_result).unwrap()).unwrap();
+    fs::write(f.f.root.join("report.md"), "AC1 verified").unwrap();
+    ok(cli(
+        &f.f.root,
+        false,
+        &["submit", "demo-001", "0", "plan", "report.md"],
+    ));
+    rejected(
+        f.tasks(&["complete", "demo-001", "1", result_file]),
+        "stale_story_context",
+    );
+    f.graph_file_at(1, TaskStage::Implement);
+    let replaced = ok(f.tasks(&["replace", "demo-001", "1", graph_path]));
+    assert_eq!(replaced["revision"], 2);
+    assert_eq!(replaced["stage"], "implement");
+    let packet = ok(f.tasks(&["start", "demo-001", "2", "a", "2"]));
+    assert_eq!(packet["task"]["revision"], 3);
+    rejected(
+        f.tasks(&["complete", "demo-001", "3", result_file]),
+        "stale_task_revision",
+    );
+    let mut fresh = old_result.clone();
+    fresh.task_revision = 3;
+    fs::write(&result_path, serde_json::to_vec(&fresh).unwrap()).unwrap();
+    ok(f.tasks(&["complete", "demo-001", "3", result_file]));
+
+    ok(cli(
+        &f.f.root,
+        false,
+        &["submit", "demo-001", "1", "block", "report.md"],
+    ));
+    f.graph_file_at(2, TaskStage::Implement);
+    rejected(
+        f.tasks(&["replace", "demo-001", "4", graph_path]),
+        "stale_story_context",
+    );
+    rejected(f.tasks(&["packet", "demo-001", "b"]), "stale_story_context");
+    ok(f.tasks(&["view", "demo-001"]));
+    ok(cli(
+        &f.f.root,
+        false,
+        &["submit", "demo-001", "2", "resume", "report.md"],
+    ));
+    rejected(f.tasks(&["packet", "demo-001", "b"]), "stale_story_context");
+    // Resuming the same stage still requires an explicit new graph and revision.
+    f.graph_file_at(3, TaskStage::Implement);
+    let replaced = ok(f.tasks(&["replace", "demo-001", "4", graph_path]));
+    assert_eq!(replaced["revision"], 5);
+    ok(f.tasks(&["start", "demo-001", "5", "a", "5"]));
+    rejected(
+        f.tasks(&["complete", "demo-001", "6", result_file]),
+        "stale_task_revision",
+    );
+    fresh.task_revision = 6;
+    fs::write(&result_path, serde_json::to_vec(&fresh).unwrap()).unwrap();
+    ok(f.tasks(&["complete", "demo-001", "6", result_file]));
+
+    fs::write(f.f.root.join("app/value"), "candidate").unwrap();
+    git(&f.f.root, &["add", "app/value"]);
+    git(
+        &f.f.root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=.git/no-hooks",
+            "commit",
+            "-qm",
+            "candidate",
+        ],
+    );
+    let candidate = git(&f.f.root, &["rev-parse", "HEAD"]);
+    ok(cli(
+        &f.f.root,
+        false,
+        &[
+            "submit",
+            "demo-001",
+            "3",
+            "candidate",
+            "report.md",
+            &candidate,
+        ],
+    ));
+    ok(cli(&f.f.root, false, &["gate", "demo-001", "4"]));
+    f.graph_file_at(5, TaskStage::Review);
+    ok(f.tasks(&["replace", "demo-001", "7", graph_path]));
+    ok(f.tasks(&["packet", "demo-001", "a"]));
+    ok(cli(
+        &f.f.root,
+        false,
+        &[
+            "submit",
+            "demo-001",
+            "5",
+            "approve",
+            "report.md",
+            &candidate,
+        ],
+    ));
+    let view = ok(f.tasks(&["view", "demo-001"]));
+    assert_eq!(view["revision"], 8);
+    rejected(f.tasks(&["packet", "demo-001", "a"]), "stale_story_context");
+    rejected(
+        f.tasks(&["start", "demo-001", "8", "a", "8"]),
+        "stale_story_context",
+    );
+    rejected(
+        f.tasks(&["complete", "demo-001", "8", result_file]),
+        "stale_story_context",
+    );
+    f.graph_file_at(6, TaskStage::Done);
+    rejected(
+        f.tasks(&["replace", "demo-001", "8", graph_path]),
+        "stale_story_context",
+    );
+    assert_eq!(ok(f.tasks(&["view", "demo-001"])), view);
 }
 
 #[test]
