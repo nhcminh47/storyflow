@@ -46,6 +46,17 @@ pub struct TaskJournal {
     bytes: usize,
     graph_revision: u64,
     _lock: File,
+    lock_owner: u32,
+}
+impl Drop for TaskJournal {
+    fn drop(&mut self) {
+        // No journal operation remains in flight during safe Rust destruction.
+        // Close alone can leave flock held by an unrelated pre-exec child.
+        // A forked child must not explicitly unlock its parent's description.
+        if self.lock_owner == std::process::id() {
+            let _ = self._lock.unlock();
+        }
+    }
 }
 impl TaskJournal {
     pub fn open(root: &Path, context: RunContext) -> TaskResult<Self> {
@@ -69,8 +80,6 @@ impl TaskJournal {
         lock.try_lock()
             .map_err(|_| error("task_locked", "another task writer owns the lock"))?;
         let dir = run.join("tasks");
-        create_dir(&dir)?;
-        create_dir(&dir.join("events"))?;
         let mut journal = Self {
             dir,
             view: TaskView::empty(&context),
@@ -80,7 +89,11 @@ impl TaskJournal {
             bytes: 0,
             graph_revision: 0,
             _lock: lock,
+            lock_owner: std::process::id(),
         };
+        // Construct the lock owner before fallible setup so errors also release it.
+        create_dir(&journal.dir)?;
+        create_dir(&journal.dir.join("events"))?;
         let mut entries = fs::read_dir(journal.dir.join("events"))?
             .map(|e| e.map(|e| e.path()))
             .collect::<Result<Vec<_>, _>>()?;

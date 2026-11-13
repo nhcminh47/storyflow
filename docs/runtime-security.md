@@ -176,8 +176,9 @@ runtime. Setting a mode or writing Markdown alone cannot restrict another progra
 Changes are confined to security modules, the new runtime companion, security
 integration in main/run configuration/snapshot, shared Git safety helpers, gate
 execution, new security/gate tests, this document and security README updates.
-No integration worktree, Issue #10 files, task journal or scheduler state machine
-is modified. The invoking user approved the narrow fixture-only ownership exception below.
+No integration worktree, Issue #10 files, scheduler state machine, attempt identity
+or journal event protocol is modified. The invoking user approved the two narrow
+ownership exceptions below: fixture argument transport and task-lock resource cleanup.
 
 Validation evidence is recorded in the PR. Local platform: Windows GNU, Rust
 1.99.1. Ubuntu WSL is installed without Rust; GitHub CI must pass Linux and Windows
@@ -198,7 +199,7 @@ its marker path, supplies it as an explicit pinned `--skip` argument, and
 fixture environment injection. The five `check` call sites pass
 `&f.root.join("gate-marker")`. No assertions, scheduler protocol or production
 behavior change. The exception changes fixture transport only; the existing assertions and production
-environment policy are preserved. No other ownership exceptions were requested.
+environment policy are preserved. The separate task-lock exception is described below.
 
 Primary API references: [Windows CreateFileW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew),
 [Linux openat](https://man7.org/linux/man-pages/man2/openat.2.html),
@@ -208,16 +209,29 @@ and Windows profile/data locations is required for installer discovery. A platfo
 compares filtered vswhere discovery against the invoking host. References:
 [Microsoft installer documentation](https://github.com/microsoft/vswhere/wiki/Installing)
 and [Rust MSVC discovery source](https://github.com/rust-lang/cc-rs/blob/main/find-msvc-tools/src/find_tools.rs).
-## Contract Change Request CCR-9-2 (pending)
 
-Ubuntu CI attempts 1 and 2 encountered `task_locked` after dropping and immediately
-reopening the unchanged TaskJournal, in separate existing DAG/scheduler tests.
-Rust's File lock is retained by inherited descriptors until every copy closes;
+## Contract Change Request CCR-9-2 (approved and implemented)
+
+Initial Ubuntu CI runs encountered `task_locked` after dropping and immediately
+reopening the baseline TaskJournal, in separate existing DAG/scheduler tests.
+Rust's File lock remains held by inherited descriptors until every copy closes;
 an unrelated parallel fork can temporarily retain it before exec. A standalone
-WSL fork/flock experiment reproduced this exact behavior. The proposed narrow fix
-is an explicit `_lock.unlock()` in `TaskJournal::drop`, plus a deterministic Linux
-fork-inheritance regression. No state, event, attempt identity or schema changes.
+WSL fork/flock experiment reproduced this behavior. A later green run did not
+resolve the defect; the original failed CI evidence is retained in the PR.
 
-The scheduler-owned file remains untouched pending the invoking user's ownership
-exception. Preserve the failed CI evidence; do not relax lock checks or retry tests
-until green. This blocks full Linux G6 validation until addressed.
+The invoking user approved the narrow `src/tasks/journal.rs` ownership exception.
+`TaskJournal::drop` now explicitly releases the lock in its acquiring process.
+A private, in-memory owner PID prevents a forked copy from explicitly unlocking
+its parent's lock. Constructing this owner before fallible directory setup also
+covers failed initialization/replay paths. No journal operation remains in flight
+at safe Rust destruction. No state, event, attempt identity, schema or public API
+changes are introduced.
+
+`tests/security_lock_inheritance.rs` holds the inherited descriptor open in a
+Linux child and verifies that dropping the parent journal permits immediate
+reopening before the child is released. A native close-only File control must
+remain locked in the same fork, proving the inherited descriptor is still live.
+The child uses only async-signal-safe
+libc operations and is reaped before asserting the result. Existing lock exclusion,
+replay, recovery and journal-byte tests remain unchanged. See the
+[Rust File lock contract](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock).
