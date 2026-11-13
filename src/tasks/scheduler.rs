@@ -112,6 +112,20 @@ pub struct SchedulerBlocker {
     pub code: String,
     pub detail: String,
     pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JournalCapacity {
+    pub max_events: usize,
+    pub max_bytes: usize,
+    pub published_events: usize,
+    pub published_bytes: usize,
+    pub reserved_events: usize,
+    pub reserved_bytes: usize,
+    pub draining: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -131,6 +145,8 @@ pub struct SchedulerStatus {
     pub dispatchable: Vec<String>,
     pub blockers: BTreeMap<String, Vec<SchedulerBlocker>>,
     pub attempts: BTreeMap<String, AttemptState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal: Option<JournalCapacity>,
 }
 
 /// Only journal publication/replay applies these events. Event time is durable
@@ -319,6 +335,7 @@ fn blocker(code: &str, detail: &str, attempt: Option<&AttemptState>) -> Schedule
         code: code.into(),
         detail: detail.into(),
         attempt_id: attempt.map(|a| a.lease.attempt_id.clone()),
+        dependency: None,
     }
 }
 
@@ -457,6 +474,7 @@ pub(crate) fn status(view: &TaskView, now: u64, current: bool) -> TaskResult<Sch
         dispatchable,
         blockers,
         attempts: state.attempts.clone(),
+        journal: None,
     })
 }
 
