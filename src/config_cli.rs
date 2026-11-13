@@ -53,15 +53,7 @@ pub fn dispatch(args: &[String]) -> Option<u8> {
         return None;
     }
     let tail: Vec<_> = args[1..].iter().map(String::as_str).collect();
-    let help = matches!(tail.as_slice(), ["--help" | "-h"])
-        || (command == "config"
-            && matches!(tail.as_slice(), ["inspect" | "validate", "--help" | "-h"]))
-        || (command == "init"
-            && matches!(
-                tail.as_slice(),
-                ["--scope", "user" | "workspace" | "repo", "--help" | "-h"]
-            ));
-    if help {
+    if tail.iter().any(|arg| matches!(*arg, "--help" | "-h")) {
         println!("{HELP}");
         return Some(0);
     }

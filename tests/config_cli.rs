@@ -220,6 +220,8 @@ fn all_new_commands_have_help_without_git_or_mutation() {
         vec!["init", "--scope", "user", "--help"],
         vec!["config", "--help"],
         vec!["config", "inspect", "--help"],
+        vec!["config", "inspect", "--effective", "--help"],
+        vec!["config", "-h", "inspect", "--effective"],
         vec!["config", "validate", "--help"],
     ] {
         let output = f
@@ -230,6 +232,28 @@ fn all_new_commands_have_help_without_git_or_mutation() {
             .unwrap();
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("--effective"));
+    }
+    let directory = f.root.join("help-must-not-create");
+    let path = directory.to_str().unwrap();
+    for scope in ["user", "workspace", "repo"] {
+        for help in ["--help", "-h"] {
+            for args in [
+                vec!["init", "--scope", scope, "--path", path, help],
+                vec!["init", "--path", path, "--scope", scope, help],
+                vec!["init", help, "--scope", scope, "--path", path],
+                vec!["init", "--path", path, help, "--scope", scope],
+            ] {
+                let output = f
+                    .command()
+                    .current_dir(&f.root)
+                    .args(&args)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{args:?}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("--effective"));
+                assert!(!directory.exists(), "help created a bootstrap directory");
+            }
+        }
     }
     assert!(!f.repo.join(".storyflow").exists());
 }
