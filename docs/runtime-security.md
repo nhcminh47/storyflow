@@ -108,11 +108,13 @@ against malicious whole-history replacement. Admission failures before a verifie
 run exists are returned as sanitized JSON rather than written into untrusted state.
 
 `storyflow::security::ManagedRuntime` is a trusted-host integration API: callers
-must obtain its context, task, exact baseline leaf modes and attempt identity from
-verified journals while retaining their locks. Constructing these structs yourself
+must obtain its context, task and attempt identity from verified journals while
+retaining their locks. Supplied leaf boundaries are optional additional host floors;
+Rust always verifies the requested pinned path itself after authorization. Constructing these structs yourself
 confers no authority. `security::process` supervises trusted infrastructure commands;
 it is not a worker tool interface. `GitBaseline::read_bounded` is now public for
-bounded pinned-blob reads. No Issue #10 contract or scheduler API changes are needed.
+bounded pinned-blob reads. Targeted metadata uses `GitBaseline::lookup_managed_blob`
+and `read_blob_bounded`. No Issue #10 contract or scheduler API changes are needed.
 
 ## Gate execution and sandbox selection
 
@@ -145,7 +147,11 @@ Each lifecycle cleanup pass has a 2-second deadline (at most one guard retry); c
 deadline and bounded output. Cleanup failure becomes an error, not a passed gate.
 Checkout evidence may remain for inspection after an operational failure. Processes
 are cleaned both on timeout and ordinary direct-parent exit; uncollected output or
-process cleanup failure returns an error. The OS may retain dead zombie records
+process cleanup failure returns an error carrying bounded partial capture. Gates
+persist that capture in their existing stdout/stderr logs and retain a non-success
+outcome; pre-launch failures have empty capture. `process::run` returns
+`Result<ProcessResult, ProcessError>`; `.kind()` exposes the I/O classification
+without putting command arguments or captured data in the error message. The OS may retain dead zombie records
 until their parent reaps them; those records cannot execute.
 
 | Platform | Trusted gate supervision | Managed-only filesystem | Hostile command sandbox |
@@ -235,3 +241,34 @@ The child uses only async-signal-safe
 libc operations and is reaped before asserting the result. Existing lock exclusion,
 replay, recovery and journal-byte tests remain unchanged. See the
 [Rust File lock contract](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock).
+
+## PR review hardening
+
+Managed requests no longer recursively enumerate the baseline under story/task
+locks. Missing grants, unsupported commands and policy scope/protection failures
+are rejected before any namespace lookup. Authorized file/blob operations walk
+only immediate sibling trees along the requested path, check portable aliases in
+each visited directory, and reject symlink, Gitlink and regular-file descendants.
+A missing baseline component permits a new scoped filesystem path; the confined
+filesystem backend still checks its actual components. Story candidate gates keep
+their full pinned-tree validation unchanged.
+
+The lookup accepts at most 4 KiB / 64 path components, 1 MiB each for an individual
+raw tree and its listing, 16,384 siblings per tree and 4 MiB combined raw/listing
+metadata per operation. Raw object size is checked before listing; oversized or
+ambiguous namespaces fail closed with a sanitized `namespace_limit` / `path_denied`
+error. There is no mutable manifest cache or unrestricted fallback. The lease is
+checked again after metadata lookup and before the file/blob effect. Tests use
+250,000 logical files in shared Git trees, oversized requested trees, denied
+requests in an invalid namespace, and pinned sibling aliases.
+
+Linux per-process `/proc/PID/stat` reads treat only `ENOENT` and `ESRCH` as a
+vanished process. Other errors still fail cleanup. Tests explicitly reject
+permission and I/O errors, so an unrelated process exit cannot disable cleanup
+verification or conceal inaccessible procfs.
+
+Post-spawn process errors preserve at most 1 MiB per captured stream in
+`ProcessError`; success is never inferred from a failed lifecycle. Private test
+seams inject errors after real bounded execution and verify persisted gate logs,
+non-success outcomes, truncation and exclusion of command/argument/cause secrets
+from the gate's error detail. No worker-controlled failure injection was added.

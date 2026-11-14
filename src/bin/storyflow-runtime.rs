@@ -143,10 +143,7 @@ fn run() -> SecurityResult<Value> {
                 "task revision does not match the active lease",
             ));
         }
-        repo::validate_candidate_namespace(&root, &state.base, &state.base)
-            .map_err(|_| error("path_denied", "unsafe pinned namespace"))?;
-        let boundaries = repo::managed_tree_boundaries(&root, &state.base)
-            .map_err(|_| error("path_denied", "pinned namespace unavailable"))?;
+
         let runtime = ManagedRuntime::new(
             &root,
             snapshot,
@@ -156,7 +153,7 @@ fn run() -> SecurityResult<Value> {
                 .ok_or_else(|| error("snapshot_integrity", "missing snapshot binding"))?,
             context,
             packet.task.spec,
-            boundaries,
+            vec![], // Optional extra host floors; execute enforces the pinned path itself.
             RuntimeIdentity {
                 attempt_id: attempt.lease.attempt_id.clone(),
                 graph_revision: attempt.graph_revision,

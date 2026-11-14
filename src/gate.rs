@@ -121,6 +121,28 @@ pub fn run(
 }
 
 fn run_check(check: &Check, checkout: &Path, logs: &Path, attempt: &str) -> Result<CheckResult> {
+    run_check_with(
+        check,
+        checkout,
+        logs,
+        attempt,
+        storyflow::security::process::run,
+    )
+}
+
+fn run_check_with(
+    check: &Check,
+    checkout: &Path,
+    logs: &Path,
+    attempt: &str,
+    execute: impl FnOnce(
+        &storyflow::security::process::CommandSpec,
+        &Path,
+    ) -> std::result::Result<
+        storyflow::security::process::ProcessResult,
+        storyflow::security::process::ProcessError,
+    >,
+) -> Result<CheckResult> {
     let stdout_path = logs.join(format!("{}.stdout", check.id));
     let stderr_path = logs.join(format!("{}.stderr", check.id));
     let spec = storyflow::security::process::CommandSpec {
@@ -128,14 +150,22 @@ fn run_check(check: &Check, checkout: &Path, logs: &Path, attempt: &str) -> Resu
         args: check.args.clone(),
         timeout: Duration::from_secs(check.timeout_seconds),
     };
-    let (outcome, exit_code, detail) = match storyflow::security::process::run(&spec, checkout) {
+    let (outcome, exit_code, detail) = match execute(&spec, checkout) {
         Err(error) => {
-            fs::write(&stdout_path, [])?;
-            fs::write(&stderr_path, [])?;
+            fs::write(&stdout_path, &error.stdout)?;
+            fs::write(&stderr_path, &error.stderr)?;
             (
                 Outcome::Error,
                 None,
-                format!("process_lifecycle_error: {:?}", error.kind()),
+                format!(
+                    "process_lifecycle_error: {:?}{}",
+                    error.kind(),
+                    if error.truncated {
+                        "; output truncated"
+                    } else {
+                        ""
+                    }
+                ),
             )
         }
         Ok(result) => {
@@ -283,4 +313,67 @@ fn checkout_git(root: &Path, args: Vec<String>) -> Result<()> {
         return Err("checkout_git_failed: bounded Git maintenance failed".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use storyflow::security::process::ProcessError;
+
+    #[test]
+    fn lifecycle_failure_persists_partial_logs_and_returns_error_outcome() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/gate-error-tests")
+            .join(std::process::id().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let fixture = Fixture(root);
+        let check = Check {
+            id: "probe".into(),
+            program: "PRIVATE_PROGRAM_SENTINEL".into(),
+            args: vec!["PRIVATE_ARGUMENT_SENTINEL".into()],
+            timeout_seconds: 1,
+        };
+        let result = run_check_with(&check, &fixture.0, &fixture.0, "attempt", |_, _| {
+            Err(ProcessError {
+                error: io::Error::new(io::ErrorKind::PermissionDenied, "PRIVATE_CAUSE_SENTINEL"),
+                stdout: b"retained stdout diagnostic\n".to_vec(),
+                stderr: b"retained stderr diagnostic\n".to_vec(),
+                truncated: false,
+            })
+        })
+        .unwrap();
+        assert!(matches!(result.outcome, Outcome::Error));
+        assert!(!result.passed());
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.log.as_deref(), Some("logs/attempt/probe"));
+        assert_eq!(
+            fs::read(fixture.0.join("probe.stdout")).unwrap(),
+            b"retained stdout diagnostic\n"
+        );
+        assert_eq!(
+            fs::read(fixture.0.join("probe.stderr")).unwrap(),
+            b"retained stderr diagnostic\n"
+        );
+        assert!(
+            result
+                .detail
+                .contains("process_lifecycle_error: PermissionDenied")
+        );
+        assert!(result.detail.contains("retained stdout diagnostic"));
+        assert!(result.detail.contains("retained stderr diagnostic"));
+        for secret in [
+            "PRIVATE_PROGRAM_SENTINEL",
+            "PRIVATE_ARGUMENT_SENTINEL",
+            "PRIVATE_CAUSE_SENTINEL",
+        ] {
+            assert!(!result.detail.contains(secret));
+        }
+    }
 }

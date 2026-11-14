@@ -27,6 +27,49 @@ pub struct ProcessResult {
     pub truncated: bool,
 }
 
+/// A process failure remains an error even when the direct child exited zero.
+/// Captures contain only the bounded bytes collected before lifecycle failure.
+pub struct ProcessError {
+    pub error: io::Error,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub truncated: bool,
+}
+impl ProcessError {
+    pub fn kind(&self) -> io::ErrorKind {
+        self.error.kind()
+    }
+}
+impl From<io::Error> for ProcessError {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+        }
+    }
+}
+impl std::fmt::Debug for ProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessError")
+            .field("error", &self.error)
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+impl std::fmt::Display for ProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+impl std::error::Error for ProcessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 /// Deliberately excludes HOME, credential variables, loader hooks, Git overrides,
 /// language startup hooks and unlisted caller-provided tool configuration variables.
 /// PATH remains a trusted host input so existing gate program names resolve.
@@ -126,7 +169,7 @@ pub fn git_executable() -> std::ffi::OsString {
         .map(|p| p.into_os_string())
         .unwrap_or_else(|_| std::ffi::OsString::from("\0host-git-unavailable"))
 }
-pub fn run(spec: &CommandSpec, cwd: &Path) -> io::Result<ProcessResult> {
+fn launch(spec: &CommandSpec, cwd: &Path) -> io::Result<ChildGuard> {
     if spec.timeout.is_zero() || spec.timeout > Duration::from_secs(3600) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -169,6 +212,21 @@ pub fn run(spec: &CommandSpec, cwd: &Path) -> io::Result<ProcessResult> {
         terminated: false,
     };
     guard.containment.attach(&guard.child)?;
+    Ok(guard)
+}
+
+pub fn run(spec: &CommandSpec, cwd: &Path) -> Result<ProcessResult, ProcessError> {
+    run_with_completion_check(spec, cwd, || Ok(()))
+}
+
+// Private fault seam for exercising operational failure after real execution.
+// Worker requests and the environment cannot supply this verifier.
+fn run_with_completion_check(
+    spec: &CommandSpec,
+    cwd: &Path,
+    completion_check: impl FnOnce() -> io::Result<()>,
+) -> Result<ProcessResult, ProcessError> {
+    let mut guard = launch(spec, cwd)?;
     let mut stdout = Capture::new(
         guard
             .child
@@ -183,47 +241,60 @@ pub fn run(spec: &CommandSpec, cwd: &Path) -> io::Result<ProcessResult> {
             .take()
             .ok_or_else(|| io::Error::other("missing stderr pipe"))?,
     )?;
-    let start = Instant::now();
-    let mut timed_out = false;
-    loop {
-        stdout.drain()?;
-        stderr.drain()?;
-        let parent_exited = guard.containment.parent_exited(&mut guard.child)?;
-        if start.elapsed() >= spec.timeout {
-            // Deadline wins even if a process exits between the last poll and
-            // observing the deadline; a timeout can never become success.
-            timed_out = true;
-            break;
-        }
-        if parent_exited {
-            break;
-        }
-        thread::sleep(POLL);
-    }
-    // Clean descendants on ordinary parent exit too. A successful parent must
-    // not leave a background worker holding pipes or touching the checkout.
-    let status = guard.cleanup()?;
-    let drain_start = Instant::now();
-    while !(stdout.eof && stderr.eof) {
-        stdout.drain()?;
-        stderr.drain()?;
-        if drain_start.elapsed() >= CLEANUP_TIMEOUT {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "output pipe cleanup deadline exceeded",
-            ));
-        }
-        if !(stdout.eof && stderr.eof) {
+    let lifecycle = (|| -> io::Result<(Option<ExitStatus>, bool)> {
+        let start = Instant::now();
+        let mut timed_out = false;
+        loop {
+            stdout.drain()?;
+            stderr.drain()?;
+            let parent_exited = guard.containment.parent_exited(&mut guard.child)?;
+            if start.elapsed() >= spec.timeout {
+                // Deadline wins even if a process exits between the last poll and
+                // observing the deadline; a timeout can never become success.
+                timed_out = true;
+                break;
+            }
+            if parent_exited {
+                break;
+            }
             thread::sleep(POLL);
         }
+        // Clean descendants on ordinary parent exit too. A successful parent must
+        // not leave a background worker holding pipes or touching the checkout.
+        let status = guard.cleanup()?;
+        let drain_start = Instant::now();
+        while !(stdout.eof && stderr.eof) {
+            stdout.drain()?;
+            stderr.drain()?;
+            if drain_start.elapsed() >= CLEANUP_TIMEOUT {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "output pipe cleanup deadline exceeded",
+                ));
+            }
+            if !(stdout.eof && stderr.eof) {
+                thread::sleep(POLL);
+            }
+        }
+        completion_check()?;
+        Ok((status, timed_out))
+    })();
+    let truncated = stdout.truncated || stderr.truncated;
+    match lifecycle {
+        Ok((status, timed_out)) => Ok(ProcessResult {
+            status,
+            timed_out,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            truncated,
+        }),
+        Err(error) => Err(ProcessError {
+            error,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            truncated,
+        }),
     }
-    Ok(ProcessResult {
-        status,
-        timed_out,
-        truncated: stdout.truncated || stderr.truncated,
-        stdout: stdout.bytes,
-        stderr: stderr.bytes,
-    })
 }
 
 struct ChildGuard {
@@ -377,7 +448,7 @@ mod platform {
                 }
                 let stat = match std::fs::read_to_string(entry.path().join("stat")) {
                     Ok(stat) => stat,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) if vanished_process(&error) => continue,
                     Err(error) => return Err(error),
                 };
                 let (_, fields) = stat
@@ -399,6 +470,12 @@ mod platform {
             Ok(true)
         }
     }
+    // procfs can report ESRCH after open when the process is reaped before read.
+    // Only a vanished per-PID record is ignorable; permissions/I/O still fail.
+    fn vanished_process(error: &io::Error) -> bool {
+        matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+    }
+
     pub(super) trait PipeReader: Read {
         fn prepare_pipe(&self) -> io::Result<()>;
         fn read_ready(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
@@ -417,6 +494,23 @@ mod platform {
         }
         fn read_ready(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             self.read(buffer)
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn vanished_proc_records_are_the_only_ignored_read_errors() {
+            for code in [libc::ENOENT, libc::ESRCH] {
+                assert!(vanished_process(&io::Error::from_raw_os_error(code)));
+            }
+            for code in [libc::EACCES, libc::EPERM, libc::EIO, libc::EINVAL] {
+                assert!(!vanished_process(&io::Error::from_raw_os_error(code)));
+            }
+            assert!(!vanished_process(&io::Error::new(
+                io::ErrorKind::NotFound,
+                "no OS disappearance code"
+            )));
         }
     }
 }
@@ -724,5 +818,70 @@ mod platform {
         fn read_ready(&mut self, _: &mut [u8]) -> io::Result<usize> {
             Err(unsupported())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, io::Write, path::PathBuf};
+
+    #[test]
+    #[ignore]
+    fn diagnostic_fixture() {
+        io::stdout()
+            .write_all(b"retained stdout diagnostic\n")
+            .unwrap();
+        io::stdout()
+            .write_all(&vec![b'x'; MAX_OUTPUT_BYTES * 2])
+            .unwrap();
+        io::stderr()
+            .write_all(b"retained stderr diagnostic\n")
+            .unwrap();
+    }
+
+    #[test]
+    fn lifecycle_failure_retains_bounded_capture_without_becoming_success() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/process-error-tests")
+            .join(std::process::id().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let fixture = Fixture(root);
+        let spec = CommandSpec {
+            program: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: [
+                "--exact",
+                "security::process::tests::diagnostic_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]
+            .map(str::to_owned)
+            .into(),
+            timeout: Duration::from_secs(15),
+        };
+        let error = run_with_completion_check(&spec, &fixture.0, || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "synthetic cleanup verification failure",
+            ))
+        })
+        .err()
+        .expect("cleanup failure must remain Err despite exit zero");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.truncated);
+        assert_eq!(error.stdout.len(), MAX_OUTPUT_BYTES);
+        assert!(String::from_utf8_lossy(&error.stdout).contains("retained stdout diagnostic"));
+        assert!(String::from_utf8_lossy(&error.stderr).contains("retained stderr diagnostic"));
+        assert!(!format!("{error:?}").contains("retained stdout diagnostic"));
     }
 }

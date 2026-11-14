@@ -70,7 +70,8 @@ impl Operation {
     }
 }
 
-/// Leaf modes from the pinned Git tree. A Gitlink/symlink is never a file scope.
+/// Optional extra host leaf floors; execute always validates the pinned path.
+/// A Gitlink/symlink is never a file scope.
 #[derive(Clone, Debug)]
 pub struct TreeBoundary {
     pub path: String,
@@ -295,30 +296,7 @@ impl ManagedRuntime {
                 "managed lease expired before execution",
             ))
         } else {
-            match operation {
-                Operation::Read { path } => super::files::read(&self.root, path, MAX_FILE_BYTES)
-                    .map_err(|_| error("path_denied", "confined file read refused"))
-                    .and_then(content),
-                Operation::Write { path, content } => {
-                    super::files::write(&self.root, path, content.as_bytes())
-                        .map_err(|_| error("path_denied", "confined file write refused"))
-                        .map(|()| serde_json::json!({"written":content.len()}))
-                }
-                Operation::GitRead { path } => config::GitBaseline {
-                    root: self.root.clone(),
-                    commit: self.snapshot.base.clone(),
-                }
-                .read_bounded(
-                    path,
-                    &config::Origin::new(config::Scope::Repo, "pinned", "managed_read"),
-                    MAX_FILE_BYTES,
-                )
-                .map_err(|_| error("path_denied", "pinned blob read refused"))
-                .and_then(content),
-                Operation::Git { .. } | Operation::Shell { .. } => {
-                    unreachable!("authorized managed-only operations")
-                }
-            }
+            self.execute_authorized(operation, clock)
         };
         self.record(
             audit,
@@ -331,6 +309,66 @@ impl ManagedRuntime {
             result.as_ref().err().map(|e| e.code),
         )?;
         result
+    }
+    // All callers pass capability/scope authorization and durable intent first.
+    // Baseline checks are mandatory here, independent of caller-provided floors.
+    fn execute_authorized(
+        &self,
+        operation: &Operation,
+        clock: &dyn crate::tasks::Clock,
+    ) -> SecurityResult<serde_json::Value> {
+        let path = match operation {
+            Operation::Read { path }
+            | Operation::Write { path, .. }
+            | Operation::GitRead { path } => path,
+            Operation::Git { .. } | Operation::Shell { .. } => {
+                unreachable!("unsupported operations cannot be authorized")
+            }
+        };
+        let baseline = config::GitBaseline {
+            root: self.root.clone(),
+            commit: self.snapshot.base.clone(),
+        };
+        let origin = config::Origin::new(config::Scope::Repo, "pinned", "managed_path");
+        let object = baseline.lookup_managed_blob(path, &origin).map_err(|e| {
+            if e.code == "managed_namespace_limit" {
+                error(
+                    "namespace_limit",
+                    "pinned namespace metadata limit exceeded",
+                )
+            } else {
+                error("path_denied", "pinned namespace lookup refused")
+            }
+        })?;
+        if clock.now_ms() >= self.identity.expires_at_ms {
+            return Err(error(
+                "lease_denied",
+                "managed lease expired before execution",
+            ));
+        }
+        match operation {
+            Operation::Read { path } => super::files::read(&self.root, path, MAX_FILE_BYTES)
+                .map_err(|_| error("path_denied", "confined file read refused"))
+                .and_then(content),
+            Operation::Write { path, content } => {
+                super::files::write(&self.root, path, content.as_bytes())
+                    .map_err(|_| error("path_denied", "confined file write refused"))
+                    .map(|()| serde_json::json!({"written":content.len()}))
+            }
+            Operation::GitRead { .. } => baseline
+                .read_blob_bounded(
+                    object
+                        .as_deref()
+                        .ok_or_else(|| error("path_denied", "pinned file is absent"))?,
+                    &origin,
+                    MAX_FILE_BYTES,
+                )
+                .map_err(|_| error("path_denied", "pinned blob read refused"))
+                .and_then(content),
+            Operation::Git { .. } | Operation::Shell { .. } => {
+                unreachable!("unsupported operations cannot be authorized")
+            }
+        }
     }
     fn record(
         &self,

@@ -102,6 +102,68 @@ impl Fixture {
         );
         String::from_utf8(out.stdout).unwrap().trim().into()
     }
+    fn git_input(&self, args: &[&str], input: &[u8]) -> String {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "git input {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+    fn tree(&self, entries: &str) -> String {
+        self.git_input(&["mktree", "-z"], entries.as_bytes())
+    }
+    fn replace_tree_entry(
+        &self,
+        tree: &str,
+        name: &str,
+        mode: &str,
+        kind: &str,
+        object: &str,
+    ) -> String {
+        let out = self.git_raw(&["ls-tree", "-z", tree]);
+        assert!(out.status.success());
+        let mut entries: Vec<u8> = out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|entry| {
+                !entry.is_empty() && entry.split(|b| *b == b'\t').nth(1) != Some(name.as_bytes())
+            })
+            .flat_map(|entry| entry.iter().copied().chain(std::iter::once(0)))
+            .collect();
+        entries.extend_from_slice(format!("{mode} {kind} {object}\t{name}\0").as_bytes());
+        self.git_input(&["mktree", "-z"], &entries)
+    }
+    fn pin_tree(&mut self, tree: &str) {
+        self.base = self.git_input(
+            &["commit-tree", tree, "-p", &self.base],
+            b"namespace regression fixture\n",
+        );
+        self.git(&["update-ref", "HEAD", &self.base]);
+    }
+    fn attach_app_tree(&mut self, name: &str, subtree: &str) {
+        let app = self.git(&["rev-parse", &format!("{}:app", self.base)]);
+        let app = self.replace_tree_entry(&app, name, "040000", "tree", subtree);
+        let root = self.git(&["rev-parse", &format!("{}^{{tree}}", self.base)]);
+        let root = self.replace_tree_entry(&root, "app", "040000", "tree", &app);
+        self.pin_tree(&root);
+    }
     fn commit(&self) -> String {
         self.git(&["add", "--all"]);
         self.git(&["commit", "-qm", "security fixture"]);
@@ -697,4 +759,128 @@ fn absent_tool_permissions_default_to_no_managed_grants() {
         "pinned value\n"
     );
     assert!(!f.root.join("gate-ran").exists());
+}
+
+#[test]
+fn large_unrelated_tree_does_not_require_recursive_namespace_scans() {
+    let mut f = Fixture::new(&["read", "write", "git"]);
+    let blob = f.git_input(&["hash-object", "-w", "--stdin"], b"bulk pinned content\n");
+    let leaves: String = (0..50)
+        .map(|n| format!("100644 blob {blob}\tentry-{n:05}.txt\0"))
+        .collect();
+    let leaf_tree = f.tree(&leaves);
+    // Two small shared Git objects describe 250,000 files without populating
+    // the filesystem. Only requested sibling trees may enter the lookup budget.
+    let directories: String = (0..5_000)
+        .map(|n| format!("040000 tree {leaf_tree}\tdir-{n:05}\0"))
+        .collect();
+    let bulk = f.tree(&directories);
+    let root = f.git(&["rev-parse", &format!("{}^{{tree}}", f.base)]);
+    let root = f.replace_tree_entry(&root, "bulk", "040000", "tree", &bulk);
+    f.pin_tree(&root);
+    f.start_with_scopes(&["app", "bulk"], &["app"], 60_000);
+    assert_eq!(
+        f.allowed(json!({"op":"read","path":"app/value.txt"}))["result"]["content"],
+        "pinned value\n"
+    );
+    assert_eq!(
+        f.allowed(json!({"op":"git_read","path":"bulk/dir-04999/entry-00049.txt"}))["result"]["content"],
+        "bulk pinned content\n"
+    );
+    f.allowed(json!({"op":"write","path":"app/value.txt","content":"managed after large tree\n"}));
+}
+
+#[test]
+fn oversized_requested_tree_fails_closed_before_file_effects() {
+    let mut f = Fixture::new(&["read", "write", "git"]);
+    let blob = f.git(&["rev-parse", &format!("{}:app/value.txt", f.base)]);
+    let long_name = "n".repeat(210);
+    let mut entries: String = (0..5_000)
+        .map(|n| format!("100644 blob {blob}\t{long_name}-{n:05}.txt\0"))
+        .collect();
+    entries.push_str(&format!("100644 blob {blob}\tvalue.txt\0"));
+    let wide = f.tree(&entries);
+    assert!(
+        f.git(&["cat-file", "-s", &wide]).parse::<usize>().unwrap()
+            > storyflow::config::GitBaseline::MANAGED_TREE_BYTES
+    );
+    f.attach_app_tree("wide", &wide);
+    f.write("app/wide/value.txt", "unchanged namespace-limit sentinel\n");
+    f.start();
+    for operation in [
+        json!({"op":"read","path":"app/wide/value.txt"}),
+        json!({"op":"write","path":"app/wide/value.txt","content":"must not write"}),
+        json!({"op":"git_read","path":"app/wide/value.txt"}),
+    ] {
+        assert_eq!(f.denied(operation)["error"]["code"], "namespace_limit");
+    }
+    assert_eq!(
+        fs::read_to_string(f.repo.join("app/wide/value.txt")).unwrap(),
+        "unchanged namespace-limit sentinel\n"
+    );
+    assert!(f.audit().contains("namespace_limit"));
+}
+
+fn add_pinned_case_collision(f: &mut Fixture) {
+    let blob = f.git(&["rev-parse", &format!("{}:app/value.txt", f.base)]);
+    let app = f.git(&["rev-parse", &format!("{}:app", f.base)]);
+    let app = f.replace_tree_entry(&app, "Extra.txt", "100644", "blob", &blob);
+    let app = f.replace_tree_entry(&app, "extra.txt", "100644", "blob", &blob);
+    let root = f.git(&["rev-parse", &format!("{}^{{tree}}", f.base)]);
+    let root = f.replace_tree_entry(&root, "app", "040000", "tree", &app);
+    f.pin_tree(&root);
+}
+
+#[test]
+fn denied_capability_precedes_any_namespace_inspection() {
+    let mut f = Fixture::new(&[]);
+    add_pinned_case_collision(&mut f);
+    f.start();
+    // A namespace walk would reject this collision. Missing grants must instead
+    // deny before walking it, including denied Git and shell requests.
+    for operation in [
+        json!({"op":"read","path":"app/value.txt"}),
+        json!({"op":"write","path":"app/value.txt","content":"must not write"}),
+        json!({"op":"git_read","path":"app/value.txt"}),
+        shell_probe(&f),
+    ] {
+        assert_eq!(f.denied(operation)["error"]["code"], "capability_denied");
+    }
+    assert_eq!(
+        fs::read_to_string(f.repo.join("app/value.txt")).unwrap(),
+        "pinned value\n"
+    );
+}
+
+#[test]
+fn targeted_lookup_preserves_pinned_sibling_alias_rejection() {
+    let mut f = Fixture::new(&["read", "write", "git"]);
+    add_pinned_case_collision(&mut f);
+    f.start();
+    for operation in [
+        json!({"op":"read","path":"app/value.txt"}),
+        json!({"op":"write","path":"app/value.txt","content":"must not write"}),
+        json!({"op":"git_read","path":"app/value.txt"}),
+    ] {
+        assert_eq!(f.denied(operation)["error"]["code"], "path_denied");
+    }
+    assert_eq!(
+        fs::read_to_string(f.repo.join("app/value.txt")).unwrap(),
+        "pinned value\n"
+    );
+}
+
+#[test]
+fn excessive_path_depth_is_rejected_before_filesystem_access() {
+    let mut f = Fixture::new(&["read", "write"]);
+    f.start();
+    let path = format!(
+        "app/{}value",
+        "deep/".repeat(storyflow::config::GitBaseline::MANAGED_PATH_COMPONENTS)
+    );
+    assert_eq!(
+        f.denied(json!({"op":"write","path":path,"content":"must not write"}))["error"]["code"],
+        "namespace_limit"
+    );
+    assert!(!f.repo.join("app/deep").exists());
 }
