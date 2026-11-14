@@ -23,7 +23,20 @@ pub fn root() -> Result<PathBuf> {
 }
 
 pub fn git(root: &Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = Command::new(storyflow::security::process::git_executable());
+    storyflow::security::process::configure_environment(&mut command);
+    command.args([
+        "--no-pager",
+        "--no-lazy-fetch",
+        "-c",
+        if cfg!(windows) {
+            "core.hooksPath=NUL"
+        } else {
+            "core.hooksPath=/dev/null"
+        },
+        "-c",
+        "core.fsmonitor=false",
+    ]);
     for (key, _) in std::env::vars_os() {
         if key
             .to_string_lossy()
@@ -34,6 +47,13 @@ pub fn git(root: &Path) -> Command {
         }
     }
     command.current_dir(root).env("GIT_NO_REPLACE_OBJECTS", "1");
+    command.env("GIT_CONFIG_NOSYSTEM", "1").env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
     if cfg!(windows) {
         command.args(["-c", "core.longpaths=true"]);
     }

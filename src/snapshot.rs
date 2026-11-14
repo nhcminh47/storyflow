@@ -36,6 +36,9 @@ pub struct RunSnapshot {
     pub story: String,
     pub base: String,
     pub effective: EffectiveConfig,
+    /// Opt-in managed-only admission; omission preserves historical snapshot digests.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub managed_only: bool,
 }
 
 impl RunSnapshot {
@@ -61,6 +64,7 @@ impl RunSnapshot {
             story: story.into(),
             base: base.into(),
             effective,
+            managed_only: false,
         };
         snapshot.validate(story, base)?;
         snapshot.canonical_bytes()?;
@@ -68,9 +72,9 @@ impl RunSnapshot {
     }
 
     /// A host must verify its own enforceable permissions before dispatching.
-    /// The CLI cannot enforce worker restrictions yet, so it admits only its full profile.
+    /// Reduced grants require the explicitly pinned managed-only host profile.
     pub fn require_cli_capabilities(&self, capabilities: &BTreeSet<String>) -> Result<()> {
-        if &self.effective.capabilities.granted != capabilities {
+        if !self.managed_only && &self.effective.capabilities.granted != capabilities {
             return Err("unsupported_capability_enforcement: this CLI host cannot enforce reduced worker permissions; run refused".into());
         }
         for role in config::REQUIRED_WORKERS {
@@ -161,6 +165,7 @@ impl RunSnapshot {
             "checks": self.effective.policy.checks.iter().map(|c| json!({"id": c.value.id, "origin": c.origin})).collect::<Vec<_>>(),
             "models": self.effective.models.iter().map(|(tier, m)| (tier.clone(), m.origin.clone())).collect::<std::collections::BTreeMap<_, _>>(),
             "capabilities": self.effective.capabilities,
+            "managed_only": self.managed_only,
         }))
     }
 }

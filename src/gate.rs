@@ -7,10 +7,13 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+pub struct GateOptions {
+    pub validate_namespace: bool,
+    pub backend: storyflow::security::SandboxBackend,
+}
 
 pub fn run(
     root: &Path,
@@ -19,8 +22,9 @@ pub fn run(
     story: &Story,
     base: &str,
     candidate: &str,
-    validate_namespace: bool,
+    options: GateOptions,
 ) -> Result<Vec<CheckResult>> {
+    let validate_namespace = options.validate_namespace;
     if validate_namespace
         && let Err(error) = repo::validate_candidate_namespace(root, base, candidate)
     {
@@ -78,6 +82,16 @@ pub fn run(
     if !scope_ok {
         return Ok(results);
     }
+    if let Err(error) = options.backend.authorize_command() {
+        results.push(CheckResult {
+            id: "sandbox".into(),
+            outcome: Outcome::Error,
+            exit_code: None,
+            detail: error.to_string(),
+            log: None,
+        });
+        return Ok(results);
+    }
     let attempt = format!(
         "{}-{}",
         std::process::id(),
@@ -94,50 +108,96 @@ pub fn run(
             break;
         }
     }
-    checkout.remove();
+    if checkout.remove().is_err() {
+        results.push(CheckResult {
+            id: "cleanup".into(),
+            outcome: Outcome::Error,
+            exit_code: None,
+            detail: "checkout_cleanup_failed: inspect retained checkout".into(),
+            log: None,
+        });
+    }
     Ok(results)
 }
 
 fn run_check(check: &Check, checkout: &Path, logs: &Path, attempt: &str) -> Result<CheckResult> {
+    run_check_with(
+        check,
+        checkout,
+        logs,
+        attempt,
+        storyflow::security::process::run,
+    )
+}
+
+fn run_check_with(
+    check: &Check,
+    checkout: &Path,
+    logs: &Path,
+    attempt: &str,
+    execute: impl FnOnce(
+        &storyflow::security::process::CommandSpec,
+        &Path,
+    ) -> std::result::Result<
+        storyflow::security::process::ProcessResult,
+        storyflow::security::process::ProcessError,
+    >,
+) -> Result<CheckResult> {
     let stdout_path = logs.join(format!("{}.stdout", check.id));
     let stderr_path = logs.join(format!("{}.stderr", check.id));
-    let mut command = Command::new(&check.program);
-    command
-        .args(&check.args)
-        .current_dir(checkout)
-        .env("TZ", "UTC")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(File::create(&stdout_path)?)
-        .stderr(File::create(&stderr_path)?);
-    let (outcome, exit_code, detail) = match command.spawn() {
-        Err(error) => (Outcome::Error, None, error.to_string()),
-        Ok(mut child) => {
-            let start = Instant::now();
-            let timeout = Duration::from_secs(check.timeout_seconds);
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    let outcome = if status.success() {
+    let spec = storyflow::security::process::CommandSpec {
+        program: check.program.clone(),
+        args: check.args.clone(),
+        timeout: Duration::from_secs(check.timeout_seconds),
+    };
+    let (outcome, exit_code, detail) = match execute(&spec, checkout) {
+        Err(error) => {
+            fs::write(&stdout_path, &error.stdout)?;
+            fs::write(&stderr_path, &error.stderr)?;
+            (
+                Outcome::Error,
+                None,
+                format!(
+                    "process_lifecycle_error: {:?}{}",
+                    error.kind(),
+                    if error.truncated {
+                        "; output truncated"
+                    } else {
+                        ""
+                    }
+                ),
+            )
+        }
+        Ok(result) => {
+            fs::write(&stdout_path, result.stdout)?;
+            fs::write(&stderr_path, result.stderr)?;
+            let suffix = if result.truncated {
+                "; output truncated"
+            } else {
+                ""
+            };
+            if result.timed_out {
+                (
+                    Outcome::Timeout,
+                    None,
+                    format!("exceeded {}s{suffix}", check.timeout_seconds),
+                )
+            } else if let Some(status) = result.status {
+                (
+                    if status.success() {
                         Outcome::Pass
                     } else {
                         Outcome::Fail
-                    };
-                    break (outcome, status.code(), status.to_string());
-                }
-                if start.elapsed() >= timeout {
-                    if let Err(error) = child.kill()
-                        && child.try_wait()?.is_none()
-                    {
-                        return Err(error.into());
-                    }
-                    child.wait()?;
-                    break (
-                        Outcome::Timeout,
-                        None,
-                        format!("exceeded {}s", check.timeout_seconds),
-                    );
-                }
-                thread::sleep(Duration::from_millis(50));
+                    },
+                    status.code(),
+                    format!("{status}{suffix}"),
+                )
+            } else {
+                (
+                    Outcome::Error,
+                    None,
+                    "process_lifecycle_error: no exit status".into(),
+                )
             }
         }
     };
@@ -176,12 +236,16 @@ struct Checkout<'a> {
 impl<'a> Checkout<'a> {
     fn new(root: &'a Path, path: PathBuf, commit: &str) -> Result<Self> {
         fs::create_dir_all(path.parent().ok_or("invalid checkout path")?)?;
-        repo::checked(
-            repo::git(root)
-                .args(["worktree", "add", "--detach", "--quiet"])
-                .arg(&path)
-                .arg(commit)
-                .output()?,
+        checkout_git(
+            root,
+            vec![
+                "worktree".into(),
+                "add".into(),
+                "--detach".into(),
+                "--quiet".into(),
+                path.to_str().ok_or("invalid checkout path")?.into(),
+                commit.into(),
+            ],
         )?;
         Ok(Self {
             root,
@@ -190,22 +254,20 @@ impl<'a> Checkout<'a> {
         })
     }
 
-    fn remove(mut self) {
+    fn remove(mut self) -> Result<()> {
         self.active = false;
-        if let Err(error) = self.cleanup() {
-            eprintln!(
-                "could not remove gate checkout {}: {error}",
-                self.path.display()
-            );
-        }
+        self.cleanup()
     }
 
     fn cleanup(&self) -> Result<()> {
-        repo::checked(
-            repo::git(self.root)
-                .args(["worktree", "remove", "--force"])
-                .arg(&self.path)
-                .output()?,
+        checkout_git(
+            self.root,
+            vec![
+                "worktree".into(),
+                "remove".into(),
+                "--force".into(),
+                self.path.to_str().ok_or("invalid checkout path")?.into(),
+            ],
         )?;
         Ok(())
     }
@@ -215,6 +277,103 @@ impl Drop for Checkout<'_> {
     fn drop(&mut self) {
         if self.active {
             let _ = self.cleanup();
+        }
+    }
+}
+
+// Checkout maintenance uses the same bounded process lifecycle as gate commands.
+fn checkout_git(root: &Path, args: Vec<String>) -> Result<()> {
+    let mut safe_args: Vec<String> = [
+        "--no-replace-objects",
+        "--no-lazy-fetch",
+        "-c",
+        if cfg!(windows) {
+            "core.hooksPath=NUL"
+        } else {
+            "core.hooksPath=/dev/null"
+        },
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.longpaths=true",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    safe_args.extend(args);
+    let output = storyflow::security::process::run(
+        &storyflow::security::process::CommandSpec {
+            program: "git".into(),
+            args: safe_args,
+            timeout: Duration::from_secs(60),
+        },
+        root,
+    )?;
+    if output.timed_out || !output.status.is_some_and(|s| s.success()) {
+        return Err("checkout_git_failed: bounded Git maintenance failed".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use storyflow::security::process::ProcessError;
+
+    #[test]
+    fn lifecycle_failure_persists_partial_logs_and_returns_error_outcome() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/gate-error-tests")
+            .join(std::process::id().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let fixture = Fixture(root);
+        let check = Check {
+            id: "probe".into(),
+            program: "PRIVATE_PROGRAM_SENTINEL".into(),
+            args: vec!["PRIVATE_ARGUMENT_SENTINEL".into()],
+            timeout_seconds: 1,
+        };
+        let result = run_check_with(&check, &fixture.0, &fixture.0, "attempt", |_, _| {
+            Err(ProcessError {
+                error: io::Error::new(io::ErrorKind::PermissionDenied, "PRIVATE_CAUSE_SENTINEL"),
+                stdout: b"retained stdout diagnostic\n".to_vec(),
+                stderr: b"retained stderr diagnostic\n".to_vec(),
+                truncated: false,
+            })
+        })
+        .unwrap();
+        assert!(matches!(result.outcome, Outcome::Error));
+        assert!(!result.passed());
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.log.as_deref(), Some("logs/attempt/probe"));
+        assert_eq!(
+            fs::read(fixture.0.join("probe.stdout")).unwrap(),
+            b"retained stdout diagnostic\n"
+        );
+        assert_eq!(
+            fs::read(fixture.0.join("probe.stderr")).unwrap(),
+            b"retained stderr diagnostic\n"
+        );
+        assert!(
+            result
+                .detail
+                .contains("process_lifecycle_error: PermissionDenied")
+        );
+        assert!(result.detail.contains("retained stdout diagnostic"));
+        assert!(result.detail.contains("retained stderr diagnostic"));
+        for secret in [
+            "PRIVATE_PROGRAM_SENTINEL",
+            "PRIVATE_ARGUMENT_SENTINEL",
+            "PRIVATE_CAUSE_SENTINEL",
+        ] {
+            assert!(!result.detail.contains(secret));
         }
     }
 }

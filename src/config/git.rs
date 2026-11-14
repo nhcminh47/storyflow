@@ -13,8 +13,11 @@ pub struct GitBaseline {
 }
 
 pub(crate) fn command(root: &Path) -> Command {
-    let mut command = Command::new("git");
-    command.args(["--no-replace-objects", "-C"]).arg(root);
+    let mut command = Command::new(crate::security::process::git_executable());
+    crate::security::process::configure_environment(&mut command);
+    command
+        .args(["--no-replace-objects", "--no-lazy-fetch", "-C"])
+        .arg(root);
     // A host's unrelated Git environment must not redirect authoritative reads.
     for (key, _) in std::env::vars_os() {
         if key
@@ -26,6 +29,9 @@ pub(crate) fn command(root: &Path) -> Command {
         }
     }
     command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
     command.env("GIT_CONFIG_NOSYSTEM", "1");
     command.env(
         "GIT_CONFIG_GLOBAL",
@@ -124,13 +130,172 @@ impl GitBaseline {
     pub fn read(&self, path: &str, origin: &Origin) -> ConfigResult<Vec<u8>> {
         self.read_with_limit(path, origin, None)
     }
-    pub(crate) fn read_bounded(
+    pub fn read_bounded(&self, path: &str, origin: &Origin, limit: usize) -> ConfigResult<Vec<u8>> {
+        self.read_with_limit(path, origin, Some(limit))
+    }
+    /// Inspect only the bounded sibling trees on this path, never a recursive
+    /// namespace listing. None means a missing baseline component; Some is the
+    /// regular pinned blob ID. The runtime authorizes capabilities/scopes first.
+    pub fn lookup_managed_blob(&self, path: &str, origin: &Origin) -> ConfigResult<Option<String>> {
+        use std::collections::BTreeSet;
+        use unicode_normalization::UnicodeNormalization;
+        if path.len() > 4096
+            || path
+                .split('/')
+                .take(Self::MANAGED_PATH_COMPONENTS + 1)
+                .count()
+                > Self::MANAGED_PATH_COMPONENTS
+        {
+            return Err(namespace_limit(origin));
+        }
+        validate_relative_path(path, origin)?;
+        let parts: Vec<_> = path.split('/').collect();
+        if !object_id(&self.commit)
+            || bounded_output(&self.root, &["cat-file", "-t", &self.commit], origin, 16)?
+                != b"commit\n"
+        {
+            return Err(Diagnostic::new(
+                "invalid_baseline",
+                origin,
+                "an exact commit is required",
+            ));
+        }
+        let root = bounded_output(
+            &self.root,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{}^{{tree}}", self.commit),
+            ],
+            origin,
+            128,
+        )?;
+        let mut object = std::str::from_utf8(&root)
+            .map_err(|_| invalid_namespace(origin))?
+            .trim()
+            .to_owned();
+        let mut remaining = Self::MANAGED_METADATA_BYTES;
+        for (index, part) in parts.iter().enumerate() {
+            if !object_id(&object) {
+                return Err(invalid_namespace(origin));
+            }
+            // Bound the raw object before asking Git to materialize its listing.
+            let size = bounded_output(&self.root, &["cat-file", "-s", &object], origin, 32)?;
+            let size: usize = std::str::from_utf8(&size)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| invalid_namespace(origin))?;
+            if size > Self::MANAGED_TREE_BYTES {
+                return Err(namespace_limit(origin));
+            }
+            remaining = remaining
+                .checked_sub(size)
+                .ok_or_else(|| namespace_limit(origin))?;
+            let entries = bounded_output(
+                &self.root,
+                &["ls-tree", "-z", &object],
+                origin,
+                remaining.min(Self::MANAGED_TREE_BYTES),
+            )
+            .map_err(|e| {
+                if e.code == "artifact_too_large" {
+                    namespace_limit(origin)
+                } else {
+                    e
+                }
+            })?;
+            remaining = remaining
+                .checked_sub(entries.len())
+                .ok_or_else(|| namespace_limit(origin))?;
+            if !entries.is_empty() && entries.last() != Some(&0) {
+                return Err(invalid_namespace(origin));
+            }
+            let requested: String = part
+                .nfc()
+                .flat_map(char::to_uppercase)
+                .flat_map(char::to_lowercase)
+                .nfc()
+                .collect();
+            let mut identities = BTreeSet::new();
+            let mut selected = None;
+            for (count, entry) in entries
+                .split(|b| *b == 0)
+                .filter(|e| !e.is_empty())
+                .enumerate()
+            {
+                if count >= Self::MANAGED_TREE_ENTRIES {
+                    return Err(namespace_limit(origin));
+                }
+                let tab = entry
+                    .iter()
+                    .position(|b| *b == b'\t')
+                    .ok_or_else(|| invalid_namespace(origin))?;
+                let name = std::str::from_utf8(&entry[tab + 1..])
+                    .map_err(|_| invalid_namespace(origin))?;
+                validate_relative_path(name, origin)?;
+                if name.contains('/') {
+                    return Err(invalid_namespace(origin));
+                }
+                let key: String = name
+                    .nfc()
+                    .flat_map(char::to_uppercase)
+                    .flat_map(char::to_lowercase)
+                    .nfc()
+                    .collect();
+                if !identities.insert(key.clone()) {
+                    return Err(invalid_namespace(origin));
+                }
+                if key == requested {
+                    if name != *part {
+                        return Err(invalid_namespace(origin));
+                    }
+                    let header = std::str::from_utf8(&entry[..tab])
+                        .map_err(|_| invalid_namespace(origin))?;
+                    let fields: Vec<_> = header.split(' ').collect();
+                    if fields.len() != 3 || !object_id(fields[2]) {
+                        return Err(invalid_namespace(origin));
+                    }
+                    selected = Some((
+                        fields[0].to_owned(),
+                        fields[1].to_owned(),
+                        fields[2].to_owned(),
+                    ));
+                }
+            }
+            let Some((mode, kind, id)) = selected else {
+                return Ok(None);
+            };
+            if index == parts.len() - 1 {
+                if !matches!(mode.as_str(), "100644" | "100755") || kind != "blob" {
+                    return Err(invalid_namespace(origin));
+                }
+                return Ok(Some(id));
+            }
+            if mode != "040000" || kind != "tree" {
+                return Err(invalid_namespace(origin));
+            }
+            object = id;
+        }
+        Err(invalid_namespace(origin))
+    }
+
+    pub const MANAGED_TREE_BYTES: usize = 1_048_576;
+    pub const MANAGED_METADATA_BYTES: usize = 4_194_304;
+    pub const MANAGED_TREE_ENTRIES: usize = 16_384;
+    pub const MANAGED_PATH_COMPONENTS: usize = 64;
+
+    /// Trusted-host primitive; workers must authorize and resolve their path
+    /// through lookup_managed_blob before this bounded regular-blob read.
+    pub fn read_blob_bounded(
         &self,
-        path: &str,
+        object: &str,
         origin: &Origin,
         limit: usize,
     ) -> ConfigResult<Vec<u8>> {
-        self.read_with_limit(path, origin, Some(limit))
+        if !object_id(object) {
+            return Err(invalid_namespace(origin));
+        }
+        bounded_output(&self.root, &["cat-file", "blob", object], origin, limit)
     }
     fn read_with_limit(
         &self,
@@ -232,4 +397,22 @@ impl GitBaseline {
             .map_err(|_| Diagnostic::new("invalid_utf8", origin, "pinned artifact is not UTF-8"))?;
         Ok(bytes)
     }
+}
+
+fn object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|c| c.is_ascii_hexdigit())
+}
+fn namespace_limit(origin: &Origin) -> Diagnostic {
+    Diagnostic::new(
+        "managed_namespace_limit",
+        origin,
+        "managed namespace metadata limit exceeded",
+    )
+}
+fn invalid_namespace(origin: &Origin) -> Diagnostic {
+    Diagnostic::new(
+        "invalid_managed_path",
+        origin,
+        "unsafe or ambiguous pinned path boundary",
+    )
 }
