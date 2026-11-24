@@ -1198,6 +1198,24 @@ fn apply_staged_writes(
     after: &WorkspaceSnapshot,
     write_scope: &[String],
 ) -> Result<(), String> {
+    apply_staged_writes_with(
+        staging_root,
+        workdir,
+        before,
+        after,
+        write_scope,
+        |_| Ok(()),
+    )
+}
+
+fn apply_staged_writes_with(
+    staging_root: &Path,
+    workdir: &Path,
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+    write_scope: &[String],
+    on_write: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
     let all_paths: BTreeSet<&String> = before.entries.keys().chain(after.entries.keys()).collect();
     let mut ops = Vec::new();
 
@@ -1276,7 +1294,7 @@ fn apply_staged_writes(
     }
 
     let backups = capture_workdir_backups(workdir, &ops)?;
-    if let Err(apply_err) = apply_write_ops(workdir, &ops) {
+    if let Err(apply_err) = apply_write_ops(workdir, &ops, on_write) {
         let rollback_errors = rollback_workdir_promotion(workdir, &backups);
         if rollback_errors.is_empty() {
             return Err(format!("{apply_err} (workdir changes rolled back)"));
@@ -1328,7 +1346,12 @@ fn capture_workdir_backups(
             Ok(_) => Err(format!(
                 "refusing staged promotion over special file in workdir: {rel}"
             )),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
                 backups.insert(rel.to_owned(), WorkdirBackupEntry::Missing);
                 Ok(())
             }
@@ -1358,7 +1381,11 @@ fn capture_workdir_backups(
     Ok(backups)
 }
 
-fn apply_write_ops(workdir: &Path, ops: &[StagedWriteOp]) -> Result<(), String> {
+fn apply_write_ops(
+    workdir: &Path,
+    ops: &[StagedWriteOp],
+    mut on_write: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
     // Apply removals deepest-first, then directory creation shallowest-first, then file writes.
     for op in ops.iter().rev() {
         if let StagedWriteOp::RemoveFile { rel } = op {
@@ -1414,6 +1441,7 @@ fn apply_write_ops(workdir: &Path, ops: &[StagedWriteOp]) -> Result<(), String> 
     }
     for op in ops {
         if let StagedWriteOp::WriteFile { rel, bytes, mode } = op {
+            on_write(rel)?;
             let target = workdir.join(rel);
             if let Ok(meta) = fs::symlink_metadata(&target)
                 && meta.file_type().is_dir()
@@ -1523,8 +1551,16 @@ fn ensure_no_symlink_components(workdir: &Path, rel_path: &str) -> Result<(), St
                     "refusing to promote write through symlink in workdir: {rel_path}"
                 ));
             }
+            Ok(meta) if !meta.file_type().is_dir() => break,
             Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                break;
+            }
             Err(err) => {
                 return Err(format!(
                     "failed to inspect workdir path before promoting {rel_path}: {err}"
@@ -2227,42 +2263,49 @@ mod tests {
 
         fs::create_dir_all(workdir.path().join("app")).unwrap();
         fs::write(workdir.path().join("app/first.txt"), b"original\n").unwrap();
-        // Existing regular file at `app/second` blocks `create_dir_all` for `app/second/nested.txt`.
-        fs::write(workdir.path().join("app/second"), b"blocker file\n").unwrap();
 
-        fs::create_dir_all(staging.path().join("app/second")).unwrap();
+        fs::create_dir_all(staging.path().join("app")).unwrap();
         fs::write(staging.path().join("app/first.txt"), b"original\n").unwrap();
         let before = snapshot_workspace(staging.path(), true, MAX_BACKUP_BYTES).unwrap();
 
         fs::write(staging.path().join("app/first.txt"), b"partial mutation\n").unwrap();
-        fs::write(
-            staging.path().join("app/second/nested.txt"),
-            b"will fail on file parent\n",
-        )
-        .unwrap();
+        fs::write(staging.path().join("app/new.txt"), b"newly created\n").unwrap();
+        fs::write(staging.path().join("app/second.txt"), b"triggers failure\n").unwrap();
         let after = snapshot_workspace(staging.path(), false, 0).unwrap();
 
         let write_scope = vec![
             "app/first.txt".to_owned(),
-            "app/second/nested.txt".to_owned(),
+            "app/new.txt".to_owned(),
+            "app/second.txt".to_owned(),
         ];
-        let err = apply_staged_writes(
+        let mut saw_first_write = false;
+        let err = apply_staged_writes_with(
             staging.path(),
             workdir.path(),
             &before,
             &after,
             &write_scope,
+            |rel| {
+                if rel == "app/first.txt" {
+                    saw_first_write = true;
+                }
+                if rel == "app/second.txt" {
+                    return Err("injected mid-batch failure".to_owned());
+                }
+                Ok(())
+            },
         )
         .unwrap_err();
+        assert!(saw_first_write);
         assert!(err.contains("rolled back"), "{err}");
         assert_eq!(
             fs::read_to_string(workdir.path().join("app/first.txt")).unwrap(),
             "original\n",
-            "earlier write in the failed batch must be rolled back"
+            "modified file in failed batch must be rolled back"
         );
-        assert_eq!(
-            fs::read_to_string(workdir.path().join("app/second")).unwrap(),
-            "blocker file\n"
+        assert!(
+            !workdir.path().join("app/new.txt").exists(),
+            "newly created file in failed batch must be removed on rollback"
         );
     }
 }
