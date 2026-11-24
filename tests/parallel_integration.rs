@@ -1200,3 +1200,79 @@ fn transitive_code_prerequisites_through_read_only_task_are_included_in_task_bas
     assert_eq!(status.phase, IntegrationPhase::Ready);
     assert_eq!(status.candidate_commit.as_deref(), Some(c_c.as_str()));
 }
+
+#[test]
+fn retired_worktree_from_earlier_graph_remains_reachable_for_cleanup() {
+    let f = RepoFixture::new();
+    let ctx = f.init_story_in_implement();
+    let coordinator = IntegrationCoordinator::new(&f.root, ctx.clone()).unwrap();
+
+    let graph1 = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: f.base.clone(),
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        tasks: vec![task_spec("old-task", &[], &["messages/welcome.txt"])],
+    };
+    let mut journal = TaskJournal::open(&f.root, ctx.clone()).unwrap();
+    journal.initialize(graph1.clone()).unwrap();
+    journal.start(0, "old-task", 0).unwrap();
+    let wt_old = coordinator
+        .prepare_worktree(journal.view(), Some(&graph1), "old-task")
+        .unwrap();
+    let wt_old_dir = f.root.join(&wt_old.path);
+    assert!(wt_old_dir.is_dir());
+
+    let c_old = f.commit_in(
+        &wt_old_dir,
+        &[("messages/welcome.txt", "Old graph commit\n")],
+        "old task commit",
+    );
+    journal
+        .complete(
+            1,
+            WorkerResult {
+                schema: 1,
+                story: STORY.into(),
+                task: "old-task".into(),
+                task_revision: 1,
+                status: ResultStatus::Succeeded,
+                report: "old task done".into(),
+                commit: Some(c_old),
+                artifacts: vec![],
+            },
+        )
+        .unwrap();
+    drop(journal);
+
+    // Advance the story (block + resume) and replace the graph with a new task ID without cleaning wt_old first.
+    f.flow(&["submit", STORY, "1", "block", "report.md"]);
+    f.flow(&["submit", STORY, "2", "resume", "report.md"]);
+    let mut ctx2 = ctx.clone();
+    ctx2.story_revision = 3;
+    let coordinator2 = IntegrationCoordinator::new(&f.root, ctx2.clone())
+        .unwrap()
+        .with_graph_revision(3);
+    let graph2 = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: f.base.clone(),
+        story_revision: 3,
+        stage: TaskStage::Implement,
+        tasks: vec![task_spec("new-task", &[], &["messages/complete.txt"])],
+    };
+    let mut journal2 = TaskJournal::open(&f.root, ctx2).unwrap();
+    journal2.replace(2, graph2.clone()).unwrap();
+
+    // Status on the new graph still preserves the uncleaned worktree from the retired graph.
+    let status = coordinator2.status(journal2.view(), Some(&graph2)).unwrap();
+    assert!(status.worktrees.contains_key("old-task"));
+
+    // Cleanup of the retired worktree succeeds and removes it from both disk and state.
+    let cleaned = coordinator2
+        .cleanup_worktree(journal2.view(), Some(&graph2), "old-task")
+        .unwrap();
+    assert!(!cleaned.worktrees.contains_key("old-task"));
+    assert!(!wt_old_dir.exists());
+}

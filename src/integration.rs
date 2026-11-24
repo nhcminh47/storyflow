@@ -240,6 +240,8 @@ impl IntegrationCoordinator {
     }
 
     /// Return current status for the active task view without mutating Git refs or state.
+    /// Preserves any uncleaned worktrees from earlier story or graph revisions so they remain
+    /// reachable for explicit `cleanup_worktree` (`worktree-remove`) calls.
     pub fn status(
         &self,
         view: &TaskView,
@@ -248,34 +250,46 @@ impl IntegrationCoordinator {
         let graph_rev = self.graph_revision_for(view);
         let ledger_rev = view.revision.unwrap_or(0);
         let order = dependency_order(view, graph)?;
-        if let Some(mut saved) = self.load_state()?
-            && saved.story_revision == view.story_revision
-            && saved.graph_revision == graph_rev
-        {
-            saved.order = order;
-            saved.ledger_revision = ledger_rev;
-            return Ok(saved);
+        match self.load_state()? {
+            Some(mut saved)
+                if saved.story_revision == view.story_revision
+                    && saved.graph_revision == graph_rev =>
+            {
+                saved.order = order;
+                saved.ledger_revision = ledger_rev;
+                Ok(saved)
+            }
+            Some(saved) => Ok(IntegrationStatus {
+                schema: SCHEMA,
+                story: self.context.story.clone(),
+                base: self.context.base.clone(),
+                story_revision: view.story_revision,
+                graph_revision: graph_rev,
+                ledger_revision: ledger_rev,
+                order,
+                phase: IntegrationPhase::Pending,
+                candidate_commit: None,
+                candidate_ref: None,
+                integrated: Vec::new(),
+                blockers: Vec::new(),
+                worktrees: saved.worktrees,
+            }),
+            None => Ok(IntegrationStatus {
+                schema: SCHEMA,
+                story: self.context.story.clone(),
+                base: self.context.base.clone(),
+                story_revision: view.story_revision,
+                graph_revision: graph_rev,
+                ledger_revision: ledger_rev,
+                order,
+                phase: IntegrationPhase::Pending,
+                candidate_commit: None,
+                candidate_ref: None,
+                integrated: Vec::new(),
+                blockers: Vec::new(),
+                worktrees: BTreeMap::new(),
+            }),
         }
-        let worktrees = self
-            .load_state()?
-            .filter(|s| s.story_revision == view.story_revision && s.graph_revision == graph_rev)
-            .map(|s| s.worktrees)
-            .unwrap_or_default();
-        Ok(IntegrationStatus {
-            schema: SCHEMA,
-            story: self.context.story.clone(),
-            base: self.context.base.clone(),
-            story_revision: view.story_revision,
-            graph_revision: graph_rev,
-            ledger_revision: ledger_rev,
-            order,
-            phase: IntegrationPhase::Pending,
-            candidate_commit: None,
-            candidate_ref: None,
-            integrated: Vec::new(),
-            blockers: Vec::new(),
-            worktrees,
-        })
     }
 
     /// Provision an isolated Git worktree for a running task at its expected base commit.
@@ -392,26 +406,34 @@ impl IntegrationCoordinator {
     }
 
     /// Remove a provisioned worker worktree after confirming its worker has exited.
-    /// If the task reported a result commit (or its worktree HEAD has a commit), pins
-    /// the task input ref before removing the detached worktree so Git garbage collection
-    /// or pruning cannot lose the commit before `integrate` runs.
+    /// Allows cleaning up worktrees from either the current graph or an earlier retired
+    /// story/graph revision as long as no unstopped worker owns that task.
+    /// If the task in the current graph reported a result commit, pins the task input ref
+    /// before removing the detached worktree so Git pruning cannot lose the commit before `integrate`.
     pub fn cleanup_worktree(
         &self,
         view: &TaskView,
         graph: Option<&TaskGraph>,
         task_id: &str,
     ) -> IntegrationResult<IntegrationStatus> {
-        let task = view
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| error("unknown_task", "task does not exist"))?;
+        let mut current = self.status(view, graph)?;
+        let current_task = view.tasks.get(task_id);
+        let has_recorded_worktree = current.worktrees.contains_key(task_id);
         require(
-            !has_unstopped_worker(view, task_id) && task.status != TaskStatus::Running,
+            current_task.is_some() || has_recorded_worktree,
+            "unknown_task",
+            "task does not exist and has no recorded worktree",
+        )?;
+        require(
+            !has_unstopped_worker(view, task_id)
+                && current_task.is_none_or(|t| t.status != TaskStatus::Running),
             "worker_stop_required",
             "confirm the worker has exited before removing its worktree",
         )?;
         let graph_rev = self.graph_revision_for(view);
-        if let Some(raw_commit) = task.result.as_ref().and_then(|r| r.commit.as_ref()) {
+        if let Some(task) = current_task
+            && let Some(raw_commit) = task.result.as_ref().and_then(|r| r.commit.as_ref())
+        {
             let commit = self.resolve_commit(raw_commit).map_err(|_| {
                 error(
                     "invalid_task_commit",
@@ -421,7 +443,6 @@ impl IntegrationCoordinator {
             let input_ref = self.task_input_ref(graph_rev, task_id, task.revision);
             self.git_checked(&["update-ref", &input_ref, &commit])?;
         }
-        let mut current = self.status(view, graph)?;
         if let Some(removed) = current.worktrees.remove(task_id) {
             if self.root.join(&removed.path).exists() {
                 self.remove_git_worktree(&removed.path)?;
@@ -465,13 +486,13 @@ impl IntegrationCoordinator {
         let graph_rev = self.graph_revision_for(view);
         let order = dependency_order(view, graph)?;
 
-        let previous = self
-            .load_state()?
-            .filter(|s| s.story_revision == view.story_revision && s.graph_revision == graph_rev);
-        let worktrees = previous
+        let loaded = self.load_state()?;
+        let worktrees = loaded
             .as_ref()
             .map(|s| s.worktrees.clone())
             .unwrap_or_default();
+        let previous = loaded
+            .filter(|s| s.story_revision == view.story_revision && s.graph_revision == graph_rev);
 
         let mut blockers = Vec::new();
 
@@ -1347,9 +1368,9 @@ impl IntegrationCoordinator {
         Ok(())
     }
 
-    /// Perform an in-memory 3-way tree merge using `git merge-tree --write-tree` and synthesize
-    /// a deterministic commit object if clean. If conflicts occur, extract the exact conflicting
-    /// file paths without modifying any working tree or index.
+    /// Perform an in-memory 3-way tree merge using `git merge-tree --write-tree` (requires Git >= 2.38)
+    /// and synthesize a deterministic commit object if clean. If conflicts occur, extract the exact
+    /// conflicting file paths without modifying any working tree or index.
     fn merge_trees(
         &self,
         merge_base: &str,
@@ -1359,6 +1380,7 @@ impl IntegrationCoordinator {
         story_rev: u64,
         graph_rev: u64,
     ) -> IntegrationResult<MergeOutcome> {
+        self.require_git_merge_tree_support()?;
         let output = self
             .git_command()
             .args([
@@ -1416,6 +1438,25 @@ impl IntegrationCoordinator {
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
         ))
+    }
+
+    fn require_git_merge_tree_support(&self) -> IntegrationResult<()> {
+        let out = self.git_checked(&["--version"])?;
+        let text = String::from_utf8_lossy(&out);
+        if let Some((major, minor)) = parse_git_version(&text) {
+            require(
+                (major, minor) >= (2, 38),
+                "git_version_unsupported",
+                format!(
+                    "parallel commit integration requires Git 2.38 or newer for `git merge-tree --write-tree` (found {major}.{minor})"
+                ),
+            )
+        } else {
+            Err(error(
+                "git_version_unsupported",
+                "unable to verify Git >= 2.38 for `git merge-tree --write-tree`",
+            ))
+        }
     }
 
     /// Create a deterministic commit object from a merged tree with fixed metadata so repeated
@@ -1626,6 +1667,17 @@ pub fn under(path: &str, prefix: &str) -> bool {
             .is_some_and(|tail| tail.starts_with('/'))
 }
 
+fn parse_git_version(output: &str) -> Option<(u32, u32)> {
+    // Handles formats such as "git version 2.47.1.windows.2" or "git version 2.38.0".
+    let token = output
+        .split_whitespace()
+        .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    let mut nums = token.split('.');
+    let major = nums.next()?.parse::<u32>().ok()?;
+    let minor = nums.next()?.parse::<u32>().ok()?;
+    Some((major, minor))
+}
+
 fn is_commit_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64)
         && value
@@ -1683,5 +1735,23 @@ fn link(metadata: &fs::Metadata) -> bool {
     #[cfg(not(windows))]
     {
         metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_git_version;
+
+    #[test]
+    fn parse_git_version_handles_standard_windows_and_invalid_strings() {
+        assert_eq!(parse_git_version("git version 2.38.0\n"), Some((2, 38)));
+        assert_eq!(
+            parse_git_version("git version 2.47.1.windows.2\r\n"),
+            Some((2, 47))
+        );
+        assert_eq!(parse_git_version("git version 2.37.3"), Some((2, 37)));
+        assert_eq!(parse_git_version("git version 3.0"), Some((3, 0)));
+        assert_eq!(parse_git_version("git version unknown"), None);
+        assert_eq!(parse_git_version(""), None);
     }
 }
