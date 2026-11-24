@@ -2241,6 +2241,251 @@ fn codex_adapter_rejects_non_utf8_workspace_paths() {
 }
 
 #[test]
+fn dispatch_and_run_validates_workdir_and_timeout_before_reserving_lease() {
+    let fixture = Fixture::new();
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+    let rev_before = journal.view().revision.unwrap();
+    let trev = task_rev(&journal, "a");
+    let adapter = FakeAdapter::available("fake");
+    let cancel = CancelToken::new();
+
+    let missing_dir = fixture.root.join("does-not-exist");
+    let err_dir = dispatch_and_run(
+        &mut journal,
+        &adapter,
+        "a",
+        trev,
+        "host-1",
+        &missing_dir,
+        Duration::from_secs(5),
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap_err();
+    assert_eq!(err_dir.code, "invalid_workdir");
+
+    let file_path = fixture.root.join("app/not-a-dir.txt");
+    fs::write(&file_path, "file\n").unwrap();
+    let err_file = dispatch_and_run(
+        &mut journal,
+        &adapter,
+        "a",
+        trev,
+        "host-1",
+        &file_path,
+        Duration::from_secs(5),
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap_err();
+    assert_eq!(err_file.code, "invalid_workdir");
+
+    let err_zero = dispatch_and_run(
+        &mut journal,
+        &adapter,
+        "a",
+        trev,
+        "host-1",
+        &fixture.root,
+        Duration::ZERO,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap_err();
+    assert_eq!(err_zero.code, "invalid_timeout");
+
+    let err_subms = dispatch_and_run(
+        &mut journal,
+        &adapter,
+        "a",
+        trev,
+        "host-1",
+        &fixture.root,
+        Duration::from_micros(500),
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap_err();
+    assert_eq!(err_subms.code, "invalid_timeout");
+
+    assert_eq!(journal.view().revision.unwrap(), rev_before);
+    assert_eq!(journal.view().tasks["a"].status, TaskStatus::Ready);
+    assert_eq!(journal.view().tasks["a"].revision, trev);
+    assert_eq!(journal.scheduler_status(&clock).unwrap().active_attempts, 0);
+    assert!(adapter.requests().is_empty());
+}
+
+#[test]
+fn codex_adapter_confines_reads_via_config_in_git_worktree() {
+    fn run_git(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new(git_executable())
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    let fixture = Fixture::new();
+    let repo_root = fixture.root.join("git-config-confinement");
+    fs::create_dir_all(repo_root.join("app")).unwrap();
+    fs::create_dir_all(repo_root.join("secrets")).unwrap();
+    fs::write(repo_root.join(".gitignore"), ".storyflow/\n").unwrap();
+    fs::write(repo_root.join("app/seed.txt"), "seed\n").unwrap();
+    fs::write(repo_root.join("secrets/hidden.txt"), "do not read\n").unwrap();
+
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.name", "test"]);
+    run_git(&repo_root, &["config", "user.email", "test@local"]);
+    run_git(
+        &repo_root,
+        &["add", ".gitignore", "app/seed.txt", "secrets/hidden.txt"],
+    );
+    run_git(&repo_root, &["commit", "-m", "initial baseline"]);
+    let base = run_git(&repo_root, &["rev-parse", "HEAD"]);
+    fs::create_dir_all(repo_root.join(format!(".storyflow/{STORY}/events"))).unwrap();
+
+    let context = RunContext {
+        story: STORY.into(),
+        base: base.clone(),
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        blocked: false,
+        scope: vec!["app".into()],
+        protected: Vec::new(),
+    };
+    let mut impl_spec = spec("a", &[]);
+    impl_spec.stage = TaskStage::Implement;
+    let graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base,
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        tasks: vec![impl_spec],
+    };
+
+    let mut journal = TaskJournal::open(&repo_root, context.clone()).unwrap();
+    journal.initialize(graph.clone()).unwrap();
+    let clock = FakeClock::at(100);
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(1, 2), &clock)
+        .unwrap();
+    let dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+
+    let coordinator = IntegrationCoordinator::new(&repo_root, context).unwrap();
+    let worktree = coordinator
+        .prepare_worktree(journal.view(), Some(&graph), "a")
+        .unwrap();
+    let workdir = repo_root.join(&worktree.path);
+
+    let help_with_config =
+        "Usage: codex exec --cd <DIR> --sandbox <MODE> --config <KEY=VALUE> --json - [PROMPT]\n";
+    let runner = Arc::new(
+        MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_read_root_confinement(false),
+    );
+    runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    runner.push_ok(0, help_with_config, "", false, false);
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": dispatch.packet.task.revision,
+        "status": "succeeded",
+        "report": "wrote app/a.txt under --config read confinement",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("app/a.txt", "confined git worktree edit\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
+    let cancel = CancelToken::new();
+    let req = AdapterRequest {
+        schema: ADAPTER_SCHEMA,
+        dispatch: dispatch.clone(),
+        workdir: workdir.clone(),
+        timeout_ms: 10_000,
+        policy: ExecutionPolicy::WorkspaceWrite,
+    };
+    let outcome = adapter.execute(&req, &cancel);
+    let report = reconcile_outcome(&mut journal, &dispatch, outcome, &clock).unwrap();
+    assert_eq!(report.status, ReconcileStatus::Applied, "{report:?}");
+
+    let status = coordinator.integrate(journal.view(), Some(&graph)).unwrap();
+    assert_eq!(
+        status.phase,
+        IntegrationPhase::Ready,
+        "{:?}",
+        status.blockers
+    );
+
+    let calls = runner.calls();
+    let exec_call = calls.last().unwrap();
+    assert!(
+        exec_call
+            .args
+            .windows(2)
+            .any(|w| { w[0] == "--config" && w[1] == "default_permissions=\"storyflow_scoped\"" }),
+        "{:?}",
+        exec_call.args
+    );
+    assert!(
+        exec_call.args.windows(2).any(|w| {
+            w[0] == "--config"
+                && w[1] == "permissions.storyflow_scoped.filesystem.\":root\"=\"deny\""
+        }),
+        "{:?}",
+        exec_call.args
+    );
+    let git_dir_norm = fs::canonicalize(repo_root.join(".git"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let git_dir_trimmed = git_dir_norm.strip_prefix(r"\\?\").unwrap_or(&git_dir_norm);
+    let expected_git_deny = format!(
+        "permissions.storyflow_scoped.filesystem.{}=\"deny\"",
+        serde_json::to_string(git_dir_trimmed).unwrap()
+    );
+    assert!(
+        exec_call
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--config" && w[1] == expected_git_deny),
+        "expected {expected_git_deny} in {:?}",
+        exec_call.args
+    );
+}
+
+#[test]
 #[ignore]
 fn codex_live_smoke() {
     let fixture = Fixture::new();

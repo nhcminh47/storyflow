@@ -382,7 +382,10 @@ impl HostAdapter for CodexAdapter {
             };
         }
 
-        if !self.runner.has_read_root_confinement() {
+        let use_config_confinement =
+            !self.runner.has_read_root_confinement() && supports_config_read_confinement(&caps);
+
+        if !self.runner.has_read_root_confinement() && !use_config_confinement {
             match find_unscoped_workdir_entries(
                 &request.workdir,
                 &request.dispatch.packet.task.spec.read_scope,
@@ -530,6 +533,14 @@ impl HostAdapter for CodexAdapter {
             ExecutionPolicy::ReadOnly => "read-only".to_owned(),
             ExecutionPolicy::WorkspaceWrite => "workspace-write".to_owned(),
         });
+        if use_config_confinement {
+            append_config_read_confinement(
+                &mut args,
+                staging_dir.path(),
+                &request.workdir,
+                request.policy,
+            );
+        }
         if caps.supports_json_output {
             args.push("--json".to_owned());
         }
@@ -1363,6 +1374,76 @@ fn apply_staged_writes_with(
         paths: promoted_paths,
         backups,
     })
+}
+
+fn supports_config_read_confinement(caps: &HostCapabilities) -> bool {
+    caps.detected_flags.iter().any(|f| f == "--config")
+}
+
+fn append_config_read_confinement(
+    args: &mut Vec<String>,
+    staging_dir: &Path,
+    workdir: &Path,
+    policy: ExecutionPolicy,
+) {
+    let mut push_cfg = |kv: String| {
+        args.push("--config".to_owned());
+        args.push(kv);
+    };
+    push_cfg("default_permissions=\"storyflow_scoped\"".to_owned());
+    push_cfg("permissions.storyflow_scoped.filesystem.\":root\"=\"deny\"".to_owned());
+    push_cfg("permissions.storyflow_scoped.filesystem.\":minimal\"=\"read\"".to_owned());
+
+    let staging_policy = normalize_policy_path(staging_dir);
+    let workdir_policy = normalize_policy_path(workdir);
+    let staging_mode = match policy {
+        ExecutionPolicy::ReadOnly => "read",
+        ExecutionPolicy::WorkspaceWrite => "write",
+    };
+    if let Ok(quoted_staging) = serde_json::to_string(&staging_policy) {
+        push_cfg(format!(
+            "permissions.storyflow_scoped.filesystem.{quoted_staging}=\"{staging_mode}\""
+        ));
+    }
+    if let Ok(quoted_workdir) = serde_json::to_string(&workdir_policy) {
+        push_cfg(format!(
+            "permissions.storyflow_scoped.filesystem.{quoted_workdir}=\"deny\""
+        ));
+    }
+    if workdir_is_git_worktree(workdir)
+        && let Ok(common_dir_raw) = run_git_checked(
+            workdir,
+            &["rev-parse".to_owned(), "--git-common-dir".to_owned()],
+        )
+    {
+        let raw_path = Path::new(&common_dir_raw);
+        let abs_common = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            workdir.join(raw_path)
+        };
+        let common_policy = normalize_policy_path(&abs_common);
+        if common_policy != workdir_policy
+            && let Ok(quoted_common) = serde_json::to_string(&common_policy)
+        {
+            push_cfg(format!(
+                "permissions.storyflow_scoped.filesystem.{quoted_common}=\"deny\""
+            ));
+        }
+    }
+}
+
+fn normalize_policy_path(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let raw = resolved.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        raw
+    }
 }
 
 fn workdir_is_git_worktree(workdir: &Path) -> bool {

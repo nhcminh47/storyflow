@@ -59,6 +59,20 @@ pub fn dispatch_and_run(
     cancel: &CancelToken,
     clock: &impl Clock,
 ) -> TaskResult<ReconcileReport> {
+    if !workdir.is_dir() {
+        return Err(crate::tasks::TaskError {
+            code: "invalid_workdir",
+            detail: "adapter workdir does not exist or is not a directory".to_owned(),
+        });
+    }
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    if timeout.is_zero() || timeout_ms == 0 || timeout_ms > super::MAX_TIMEOUT_MS {
+        return Err(crate::tasks::TaskError {
+            code: "invalid_timeout",
+            detail: format!("timeout_ms must be within 1..={}", super::MAX_TIMEOUT_MS),
+        });
+    }
+
     let caps = adapter.probe();
     if !caps.available {
         return Ok(ReconcileReport {
@@ -84,7 +98,6 @@ pub fn dispatch_and_run(
             detail: "initialize the graph first".to_owned(),
         })?;
     let dispatch = journal.dispatch(rev, task, task_revision, owner, clock)?;
-    let timeout_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
     let request = AdapterRequest {
         schema: ADAPTER_SCHEMA,
         dispatch: dispatch.clone(),
