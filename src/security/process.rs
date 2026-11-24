@@ -2,7 +2,7 @@
 //! This is process supervision, not a hostile-code sandbox. Linux descendants that
 //! deliberately create another session can escape the process group.
 use std::{
-    io::{self, Read},
+    io::{self, Read, Write},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     thread,
@@ -17,6 +17,21 @@ pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
     pub timeout: Duration,
+}
+
+pub struct HostCommandSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    pub timeout: Duration,
+    pub stdin: Option<Vec<u8>>,
+    pub passthrough_env: Vec<String>,
+}
+
+/// Result of a supervised command with cooperative host cancellation.
+/// `cancelled` is reported only after the process tree and pipes are cleaned up.
+pub struct ControlledResult {
+    pub process: ProcessResult,
+    pub cancelled: bool,
 }
 
 pub struct ProcessResult {
@@ -169,8 +184,15 @@ pub fn git_executable() -> std::ffi::OsString {
         .map(|p| p.into_os_string())
         .unwrap_or_else(|_| std::ffi::OsString::from("\0host-git-unavailable"))
 }
-fn launch(spec: &CommandSpec, cwd: &Path) -> io::Result<ChildGuard> {
-    if spec.timeout.is_zero() || spec.timeout > Duration::from_secs(3600) {
+fn launch_inner(
+    program_name: &str,
+    args: &[String],
+    timeout: Duration,
+    passthrough_env: &[String],
+    pipe_stdin: bool,
+    cwd: &Path,
+) -> io::Result<ChildGuard> {
+    if timeout.is_zero() || timeout > Duration::from_secs(3600) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid command timeout",
@@ -179,7 +201,7 @@ fn launch(spec: &CommandSpec, cwd: &Path) -> io::Result<ChildGuard> {
     // Batch files cause an implicit cmd.exe invocation in std::process on Windows.
     // Only explicit interpreter programs with structured arguments are accepted.
     if cfg!(windows)
-        && Path::new(&spec.program)
+        && Path::new(program_name)
             .extension()
             .is_some_and(|extension| {
                 extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
@@ -190,19 +212,34 @@ fn launch(spec: &CommandSpec, cwd: &Path) -> io::Result<ChildGuard> {
             "implicit batch interpreter refused",
         ));
     }
-    let program = if !spec.program.contains(['/', '\\', ':']) {
-        host_executable(&spec.program)?
+    let program = if !program_name.contains(['/', '\\', ':']) {
+        host_executable(program_name)?
     } else {
-        std::path::PathBuf::from(&spec.program)
+        std::path::PathBuf::from(program_name)
     };
     let mut command = Command::new(program);
     command
-        .args(&spec.args)
+        .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_environment(&mut command);
+    for key in passthrough_env {
+        if key.is_empty() || key.contains(['=', '\0']) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid passthrough environment variable",
+            ));
+        }
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
     let containment = platform::Containment::prepare(&mut command)?;
     let child = command.spawn()?;
     let mut guard = ChildGuard {
@@ -219,6 +256,44 @@ pub fn run(spec: &CommandSpec, cwd: &Path) -> Result<ProcessResult, ProcessError
     run_with_completion_check(spec, cwd, || Ok(()))
 }
 
+/// Check cancellation before launch and during each supervision poll. A stopped
+/// request never becomes a successful command; cleanup failures remain errors.
+pub fn run_controlled(
+    spec: &CommandSpec,
+    cwd: &Path,
+    should_stop: impl FnMut() -> bool,
+) -> Result<ControlledResult, ProcessError> {
+    run_inner(
+        &spec.program,
+        &spec.args,
+        spec.timeout,
+        &[],
+        None,
+        cwd,
+        || Ok(()),
+        should_stop,
+    )
+}
+
+/// Run a host adapter subprocess under process-tree supervision with optional
+/// piped stdin and an explicit list of passthrough environment variable keys.
+pub fn run_host_command(
+    spec: &HostCommandSpec,
+    cwd: &Path,
+    should_stop: impl FnMut() -> bool,
+) -> Result<ControlledResult, ProcessError> {
+    run_inner(
+        &spec.program,
+        &spec.args,
+        spec.timeout,
+        &spec.passthrough_env,
+        spec.stdin.as_deref(),
+        cwd,
+        || Ok(()),
+        should_stop,
+    )
+}
+
 // Private fault seam for exercising operational failure after real execution.
 // Worker requests and the environment cannot supply this verifier.
 fn run_with_completion_check(
@@ -226,7 +301,79 @@ fn run_with_completion_check(
     cwd: &Path,
     completion_check: impl FnOnce() -> io::Result<()>,
 ) -> Result<ProcessResult, ProcessError> {
-    let mut guard = launch(spec, cwd)?;
+    run_inner(
+        &spec.program,
+        &spec.args,
+        spec.timeout,
+        &[],
+        None,
+        cwd,
+        completion_check,
+        || false,
+    )
+    .map(|result| result.process)
+}
+
+struct StdinJoinGuard(Option<thread::JoinHandle<()>>);
+impl StdinJoinGuard {
+    fn join(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = handle.join();
+        }
+    }
+}
+impl Drop for StdinJoinGuard {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_inner(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    passthrough_env: &[String],
+    stdin_bytes: Option<&[u8]>,
+    cwd: &Path,
+    completion_check: impl FnOnce() -> io::Result<()>,
+    mut should_stop: impl FnMut() -> bool,
+) -> Result<ControlledResult, ProcessError> {
+    if should_stop() {
+        return Ok(ControlledResult {
+            process: ProcessResult {
+                status: None,
+                timed_out: false,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                truncated: false,
+            },
+            cancelled: true,
+        });
+    }
+    // Declare before ChildGuard so ChildGuard drops first (terminating the child
+    // and breaking the stdin pipe) if an early error occurs.
+    let mut stdin_guard = StdinJoinGuard(None);
+    let mut guard = launch_inner(
+        program,
+        args,
+        timeout,
+        passthrough_env,
+        stdin_bytes.is_some(),
+        cwd,
+    )?;
+    if let Some(bytes) = stdin_bytes {
+        let mut stdin = guard
+            .child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("missing stdin pipe"))?;
+        let payload = bytes.to_vec();
+        stdin_guard.0 = Some(thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+            let _ = stdin.flush();
+        }));
+    }
     let mut stdout = Capture::new(
         guard
             .child
@@ -241,14 +388,19 @@ fn run_with_completion_check(
             .take()
             .ok_or_else(|| io::Error::other("missing stderr pipe"))?,
     )?;
-    let lifecycle = (|| -> io::Result<(Option<ExitStatus>, bool)> {
+    let lifecycle = (|| -> io::Result<(Option<ExitStatus>, bool, bool)> {
         let start = Instant::now();
         let mut timed_out = false;
+        let mut cancelled = false;
         loop {
             stdout.drain()?;
             stderr.drain()?;
             let parent_exited = guard.containment.parent_exited(&mut guard.child)?;
-            if start.elapsed() >= spec.timeout {
+            if should_stop() {
+                cancelled = true;
+                break;
+            }
+            if start.elapsed() >= timeout {
                 // Deadline wins even if a process exits between the last poll and
                 // observing the deadline; a timeout can never become success.
                 timed_out = true;
@@ -262,6 +414,7 @@ fn run_with_completion_check(
         // Clean descendants on ordinary parent exit too. A successful parent must
         // not leave a background worker holding pipes or touching the checkout.
         let status = guard.cleanup()?;
+        stdin_guard.join();
         let drain_start = Instant::now();
         while !(stdout.eof && stderr.eof) {
             stdout.drain()?;
@@ -277,16 +430,19 @@ fn run_with_completion_check(
             }
         }
         completion_check()?;
-        Ok((status, timed_out))
+        Ok((status, timed_out, cancelled))
     })();
     let truncated = stdout.truncated || stderr.truncated;
     match lifecycle {
-        Ok((status, timed_out)) => Ok(ProcessResult {
-            status,
-            timed_out,
-            stdout: stdout.bytes,
-            stderr: stderr.bytes,
-            truncated,
+        Ok((status, timed_out, cancelled)) => Ok(ControlledResult {
+            process: ProcessResult {
+                status,
+                timed_out,
+                stdout: stdout.bytes,
+                stderr: stderr.bytes,
+                truncated,
+            },
+            cancelled,
         }),
         Err(error) => Err(ProcessError {
             error,
