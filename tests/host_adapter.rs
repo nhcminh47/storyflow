@@ -2124,13 +2124,14 @@ fn codex_adapter_commits_promoted_writes_for_integration() {
     let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
     runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
     runner.push_ok(0, sandbox_help, "", false, false);
+    let forged_commit = "f".repeat(40);
     let result_json = json!({
         "story": STORY,
         "task": "a",
         "task_revision": dispatch.packet.task.revision,
         "status": "succeeded",
         "report": "created app/a.txt in staged dir",
-        "commit": null,
+        "commit": forged_commit,
         "artifacts": []
     })
     .to_string();
@@ -2158,9 +2159,13 @@ fn codex_adapter_commits_promoted_writes_for_integration() {
     let outcome = adapter.execute(&req, &cancel);
     match &outcome {
         AdapterOutcome::Completed { result, .. } => {
-            assert!(
-                result.commit.is_some(),
-                "adapter must pin commit in git worktree"
+            let pinned = result
+                .commit
+                .as_deref()
+                .expect("adapter must pin commit in git worktree");
+            assert_ne!(
+                pinned, forged_commit,
+                "untrusted worker commit must be replaced by Rust-authored commit"
             );
         }
         other => panic!("expected Completed outcome, got {other:?}"),
@@ -2177,6 +2182,62 @@ fn codex_adapter_commits_promoted_writes_for_integration() {
         status.blockers
     );
     assert!(status.candidate_commit.is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_adapter_rejects_non_utf8_workspace_paths() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-non-utf8");
+    fs::create_dir_all(workdir.join("secrets")).unwrap();
+    let raw_name = OsStr::from_bytes(b"\xff");
+    fs::write(workdir.join("secrets").join(raw_name), b"secret\n").unwrap();
+
+    let mut ctx = fixture.context.clone();
+    ctx.scope = vec!["app".into(), "secrets".into()];
+    let mut bad_spec = spec("a", &[]);
+    bad_spec.read_scope = vec!["secrets/\u{fffd}".into()];
+    let bad_graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: "1".repeat(40),
+        story_revision: 0,
+        stage: TaskStage::Plan,
+        tasks: vec![bad_spec],
+    };
+
+    let clock = FakeClock::at(100);
+    let mut journal = TaskJournal::open(&fixture.root, ctx).unwrap();
+    journal.initialize(bad_graph).unwrap();
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(1, 3), &clock)
+        .unwrap();
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.status, ReconcileStatus::Blocked);
+    assert!(report.detail.contains("non-UTF-8"), "{report:?}");
+    assert!(runner.observed_exec_paths().is_empty());
 }
 
 #[test]

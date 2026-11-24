@@ -729,7 +729,7 @@ impl HostAdapter for CodexAdapter {
             };
 
             let has_git = workdir_is_git_worktree(&request.workdir);
-            if has_git && result.commit.is_none() {
+            if has_git {
                 if promoted.paths.is_empty() {
                     let _ = rollback_workdir_promotion(&request.workdir, &promoted.backups);
                     return AdapterOutcome::InvalidOutput {
@@ -1102,11 +1102,7 @@ fn stage_dir_entries(
         let rel = path
             .strip_prefix(workdir)
             .map_err(|_| StageError::Io("workspace path escaped root".to_owned()))?;
-        let rel_str = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
+        let rel_str = rel_path_utf8(rel).map_err(|err| StageError::Io(err.to_string()))?;
         if rel_str.is_empty() || is_protected_path(&rel_str) {
             continue;
         }
@@ -1188,11 +1184,7 @@ fn collect_unscoped_entries(
         let rel = path
             .strip_prefix(workdir)
             .map_err(|_| io::Error::other("workspace path escaped root"))?;
-        let rel_str = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
+        let rel_str = rel_path_utf8(rel)?;
         if rel_str.is_empty() {
             continue;
         }
@@ -1833,11 +1825,7 @@ fn collect_snapshot(
         let rel = path
             .strip_prefix(root)
             .map_err(|_| io::Error::other("workspace path escaped root"))?;
-        let rel_str = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
+        let rel_str = rel_path_utf8(rel)?;
         if rel_str.is_empty() {
             continue;
         }
@@ -2315,6 +2303,20 @@ fn restore_mode(path: &Path, mode: u32) -> io::Result<()> {
         perms.set_readonly(mode != 0);
         fs::set_permissions(path, perms)
     }
+}
+
+fn rel_path_utf8(rel: &Path) -> io::Result<String> {
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        let Some(seg) = component.as_os_str().to_str() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-UTF-8 path component in workspace",
+            ));
+        };
+        parts.push(seg);
+    }
+    Ok(parts.join("/"))
 }
 
 fn nfc_path(value: &str) -> String {
