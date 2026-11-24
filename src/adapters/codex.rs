@@ -75,6 +75,12 @@ pub trait CodexCommandRunner: Send + Sync {
     fn has_unbroken_containment(&self) -> bool {
         true
     }
+
+    /// Returns `true` only if the runner strictly restricts filesystem reads
+    /// to `staging_dir` (refusing full-filesystem reads outside `read_scope`).
+    fn has_read_root_confinement(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Default)]
@@ -123,6 +129,12 @@ impl CodexCommandRunner for ProcessCommandRunner {
         // Windows Job Objects track all descendants regardless of session/group changes;
         // Unix process-group cleanup can be escaped via setsid().
         cfg!(windows)
+    }
+
+    fn has_read_root_confinement(&self) -> bool {
+        // Legacy `codex exec --sandbox read-only|workspace-write` grants full-filesystem
+        // read access and cannot isolate omitted files in the workspace.
+        false
     }
 }
 
@@ -367,6 +379,34 @@ impl HostAdapter for CodexAdapter {
                 worker_stopped: true,
                 reason: "cancelled before launching codex".to_owned(),
             };
+        }
+
+        if !self.runner.has_read_root_confinement() {
+            match find_unscoped_workdir_entries(
+                &request.workdir,
+                &request.dispatch.packet.task.spec.read_scope,
+            ) {
+                Ok(unscoped) if !unscoped.is_empty() => {
+                    return AdapterOutcome::HostUnavailable {
+                        provider: "codex".to_owned(),
+                        detail: sanitize_reason(&format!(
+                            "codex --sandbox does not restrict filesystem reads and cannot isolate unscoped or protected paths in workdir: {}",
+                            unscoped.join(", ")
+                        )),
+                    };
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    return AdapterOutcome::HostCrashed {
+                        correlation: fallback_correlation,
+                        worker_stopped: true,
+                        exit_code: None,
+                        detail: sanitize_reason(&format!(
+                            "failed to verify codex read_scope isolation in workdir: {err}"
+                        )),
+                    };
+                }
+            }
         }
 
         let prompt = match build_prompt(request) {
@@ -648,6 +688,24 @@ impl HostAdapter for CodexAdapter {
             }
         };
 
+        let result = WorkerResult {
+            schema: SCHEMA,
+            story: envelope.story,
+            task: envelope.task,
+            task_revision: envelope.task_revision,
+            status: envelope.status,
+            report: envelope.report,
+            commit: envelope.commit,
+            artifacts: envelope.artifacts,
+        };
+        if let Err(err) = super::runner::validate_worker_result(&result, &request.dispatch) {
+            return AdapterOutcome::InvalidOutput {
+                correlation,
+                worker_stopped,
+                detail: sanitize_reason(&format!("invalid codex worker result: {err}")),
+            };
+        }
+
         if worker_stopped
             && request.policy == ExecutionPolicy::WorkspaceWrite
             && let Err(detail) = apply_staged_writes(
@@ -667,16 +725,7 @@ impl HostAdapter for CodexAdapter {
 
         AdapterOutcome::Completed {
             correlation,
-            result: WorkerResult {
-                schema: SCHEMA,
-                story: envelope.story,
-                task: envelope.task,
-                task_revision: envelope.task_revision,
-                status: envelope.status,
-                report: envelope.report,
-                commit: envelope.commit,
-                artifacts: envelope.artifacts,
-            },
+            result,
             worker_stopped,
         }
     }
@@ -1061,6 +1110,87 @@ fn stage_dir_entries(
     Ok(())
 }
 
+fn find_unscoped_workdir_entries(workdir: &Path, read_scope: &[String]) -> io::Result<Vec<String>> {
+    let folded_scopes: Vec<String> = read_scope.iter().map(|s| fold_path(s)).collect();
+    let mut unscoped = Vec::new();
+    collect_unscoped_entries(workdir, workdir, &folded_scopes, &mut unscoped)?;
+    Ok(unscoped)
+}
+
+fn collect_unscoped_entries(
+    workdir: &Path,
+    dir: &Path,
+    folded_scopes: &[String],
+    unscoped: &mut Vec<String>,
+) -> io::Result<()> {
+    const MAX_SAMPLE: usize = 16;
+    let mut children: Vec<_> = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        if unscoped.len() >= MAX_SAMPLE {
+            break;
+        }
+        let path = child.path();
+        let rel = path
+            .strip_prefix(workdir)
+            .map_err(|_| io::Error::other("workspace path escaped root"))?;
+        let rel_str = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if rel_str.is_empty() {
+            continue;
+        }
+        if is_protected_path(&rel_str) {
+            unscoped.push(rel_str);
+            continue;
+        }
+        let folded = fold_path(&rel_str);
+        let in_read = folded_scopes
+            .iter()
+            .any(|scope| within_path(&folded, scope));
+        let is_ancestor = folded_scopes
+            .iter()
+            .any(|scope| within_path(scope, &folded));
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.file_type().is_dir() {
+            if in_read || is_ancestor {
+                collect_unscoped_entries(workdir, &path, folded_scopes, unscoped)?;
+            } else {
+                unscoped.push(rel_str);
+            }
+        } else if !in_read {
+            unscoped.push(rel_str);
+        }
+    }
+    Ok(())
+}
+
+enum StagedWriteOp {
+    RemoveFile {
+        rel: String,
+    },
+    RemoveDir {
+        rel: String,
+    },
+    EnsureDir {
+        rel: String,
+        mode: u32,
+    },
+    WriteFile {
+        rel: String,
+        bytes: Vec<u8>,
+        mode: u32,
+    },
+}
+
+enum WorkdirBackupEntry {
+    Missing,
+    Dir { mode: u32 },
+    File { bytes: Vec<u8>, mode: u32 },
+}
+
 fn apply_staged_writes(
     staging_root: &Path,
     workdir: &Path,
@@ -1068,24 +1198,6 @@ fn apply_staged_writes(
     after: &WorkspaceSnapshot,
     write_scope: &[String],
 ) -> Result<(), String> {
-    enum StagedWriteOp {
-        RemoveFile {
-            rel: String,
-        },
-        RemoveDir {
-            rel: String,
-        },
-        EnsureDir {
-            rel: String,
-            mode: u32,
-        },
-        WriteFile {
-            rel: String,
-            bytes: Vec<u8>,
-            mode: u32,
-        },
-    }
-
     let all_paths: BTreeSet<&String> = before.entries.keys().chain(after.entries.keys()).collect();
     let mut ops = Vec::new();
 
@@ -1159,6 +1271,94 @@ fn apply_staged_writes(
         }
     }
 
+    if ops.is_empty() {
+        return Ok(());
+    }
+
+    let backups = capture_workdir_backups(workdir, &ops)?;
+    if let Err(apply_err) = apply_write_ops(workdir, &ops) {
+        let rollback_errors = rollback_workdir_promotion(workdir, &backups);
+        if rollback_errors.is_empty() {
+            return Err(format!("{apply_err} (workdir changes rolled back)"));
+        }
+        return Err(format!(
+            "{apply_err} (rollback failed: {})",
+            rollback_errors.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+fn capture_workdir_backups(
+    workdir: &Path,
+    ops: &[StagedWriteOp],
+) -> Result<BTreeMap<String, WorkdirBackupEntry>, String> {
+    let mut backups = BTreeMap::new();
+    let mut record_path = |rel: &str| -> Result<(), String> {
+        if backups.contains_key(rel) {
+            return Ok(());
+        }
+        let target = workdir.join(rel);
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+                "refusing staged promotion over symlink in workdir: {rel}"
+            )),
+            Ok(meta) if meta.file_type().is_dir() => {
+                backups.insert(
+                    rel.to_owned(),
+                    WorkdirBackupEntry::Dir {
+                        mode: entry_mode(&meta),
+                    },
+                );
+                Ok(())
+            }
+            Ok(meta) if meta.file_type().is_file() => {
+                let bytes = fs::read(&target).map_err(|err| {
+                    format!("failed to back up {rel} in workdir before promotion: {err}")
+                })?;
+                backups.insert(
+                    rel.to_owned(),
+                    WorkdirBackupEntry::File {
+                        bytes,
+                        mode: entry_mode(&meta),
+                    },
+                );
+                Ok(())
+            }
+            Ok(_) => Err(format!(
+                "refusing staged promotion over special file in workdir: {rel}"
+            )),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                backups.insert(rel.to_owned(), WorkdirBackupEntry::Missing);
+                Ok(())
+            }
+            Err(err) => Err(format!(
+                "failed to inspect {rel} in workdir before promotion: {err}"
+            )),
+        }
+    };
+
+    for op in ops {
+        let rel = match op {
+            StagedWriteOp::RemoveFile { rel }
+            | StagedWriteOp::RemoveDir { rel }
+            | StagedWriteOp::EnsureDir { rel, .. }
+            | StagedWriteOp::WriteFile { rel, .. } => rel.as_str(),
+        };
+        let mut prefix = Vec::new();
+        for comp in Path::new(rel).components() {
+            let std::path::Component::Normal(part) = comp else {
+                return Err(format!("invalid staged promotion path: {rel}"));
+            };
+            prefix.push(part.to_string_lossy().into_owned());
+            let anc = prefix.join("/");
+            record_path(&anc)?;
+        }
+    }
+    Ok(backups)
+}
+
+fn apply_write_ops(workdir: &Path, ops: &[StagedWriteOp]) -> Result<(), String> {
     // Apply removals deepest-first, then directory creation shallowest-first, then file writes.
     for op in ops.iter().rev() {
         if let StagedWriteOp::RemoveFile { rel } = op {
@@ -1181,11 +1381,21 @@ fn apply_staged_writes(
     for op in ops.iter().rev() {
         if let StagedWriteOp::RemoveDir { rel } = op {
             let target = workdir.join(rel);
-            remove_dir_if_present(&target)
-                .map_err(|err| format!("failed to remove directory {rel}: {err}"))?;
+            match fs::symlink_metadata(&target) {
+                Ok(meta) if meta.file_type().is_dir() => {
+                    make_dir_accessible(&target)
+                        .and_then(|()| fs::remove_dir(&target))
+                        .map_err(|err| format!("failed to remove directory {rel}: {err}"))?;
+                }
+                Ok(_) => {
+                    return Err(format!("refusing non-directory removal in workdir: {rel}"));
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("failed to inspect {rel} in workdir: {err}")),
+            }
         }
     }
-    for op in &ops {
+    for op in ops {
         if let StagedWriteOp::EnsureDir { rel, .. } = op {
             let target = workdir.join(rel);
             if let Ok(meta) = fs::symlink_metadata(&target)
@@ -1202,7 +1412,7 @@ fn apply_staged_writes(
                 .map_err(|err| format!("failed to create directory {rel}: {err}"))?;
         }
     }
-    for op in &ops {
+    for op in ops {
         if let StagedWriteOp::WriteFile { rel, bytes, mode } = op {
             let target = workdir.join(rel);
             if let Ok(meta) = fs::symlink_metadata(&target)
@@ -1229,6 +1439,73 @@ fn apply_staged_writes(
         }
     }
     Ok(())
+}
+
+fn rollback_workdir_promotion(
+    workdir: &Path,
+    backups: &BTreeMap<String, WorkdirBackupEntry>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    // 1. Ensure existing parent dirs are writable before undoing changes.
+    for (rel, entry) in backups {
+        if matches!(entry, WorkdirBackupEntry::Dir { .. }) {
+            let _ = make_dir_accessible(&workdir.join(rel));
+        }
+    }
+    // 2. Remove anything created where WorkdirBackupEntry::Missing existed, deepest-first.
+    for (rel, entry) in backups.iter().rev() {
+        if matches!(entry, WorkdirBackupEntry::Missing) {
+            let target = workdir.join(rel);
+            let res = match fs::symlink_metadata(&target) {
+                Ok(meta) if meta.file_type().is_dir() => remove_dir_if_present(&target),
+                Ok(_) => remove_file_or_symlink(&target),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = res {
+                errors.push(format!("{rel}: {err}"));
+            }
+        }
+    }
+    // 3. Recreate directories shallowest-first with accessible modes.
+    for (rel, entry) in backups {
+        if matches!(entry, WorkdirBackupEntry::Dir { .. }) {
+            let target = workdir.join(rel);
+            if let Err(err) =
+                fs::create_dir_all(&target).and_then(|()| make_dir_accessible(&target))
+            {
+                errors.push(format!("{rel}: {err}"));
+            }
+        }
+    }
+    // 4. Restore backed-up files and their permissions.
+    for (rel, entry) in backups {
+        if let WorkdirBackupEntry::File { bytes, mode } = entry {
+            let target = workdir.join(rel);
+            if let Ok(meta) = fs::symlink_metadata(&target)
+                && meta.file_type().is_dir()
+                && let Err(err) = remove_dir_if_present(&target)
+            {
+                errors.push(format!("{rel}: {err}"));
+                continue;
+            }
+            if let Err(err) = make_writable_if_exists(&target)
+                .and_then(|()| fs::write(&target, bytes))
+                .and_then(|()| restore_mode(&target, *mode))
+            {
+                errors.push(format!("{rel}: {err}"));
+            }
+        }
+    }
+    // 5. Restore original directory modes deepest-first.
+    for (rel, entry) in backups.iter().rev() {
+        if let WorkdirBackupEntry::Dir { mode } = entry
+            && let Err(err) = restore_mode(&workdir.join(rel), *mode)
+        {
+            errors.push(format!("{rel}: {err}"));
+        }
+    }
+    errors
 }
 
 fn ensure_no_symlink_components(workdir: &Path, rel_path: &str) -> Result<(), String> {
@@ -1936,5 +2213,56 @@ impl Drop for TempArtifactsDir {
     fn drop(&mut self) {
         let _ = make_dir_accessible(&self.0);
         let _ = remove_dir_if_present(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_staged_writes_rolls_back_partial_promotion_on_failure() {
+        let staging = TempArtifactsDir::new().unwrap();
+        let workdir = TempArtifactsDir::new().unwrap();
+
+        fs::create_dir_all(workdir.path().join("app")).unwrap();
+        fs::write(workdir.path().join("app/first.txt"), b"original\n").unwrap();
+        // Existing regular file at `app/second` blocks `create_dir_all` for `app/second/nested.txt`.
+        fs::write(workdir.path().join("app/second"), b"blocker file\n").unwrap();
+
+        fs::create_dir_all(staging.path().join("app/second")).unwrap();
+        fs::write(staging.path().join("app/first.txt"), b"original\n").unwrap();
+        let before = snapshot_workspace(staging.path(), true, MAX_BACKUP_BYTES).unwrap();
+
+        fs::write(staging.path().join("app/first.txt"), b"partial mutation\n").unwrap();
+        fs::write(
+            staging.path().join("app/second/nested.txt"),
+            b"will fail on file parent\n",
+        )
+        .unwrap();
+        let after = snapshot_workspace(staging.path(), false, 0).unwrap();
+
+        let write_scope = vec![
+            "app/first.txt".to_owned(),
+            "app/second/nested.txt".to_owned(),
+        ];
+        let err = apply_staged_writes(
+            staging.path(),
+            workdir.path(),
+            &before,
+            &after,
+            &write_scope,
+        )
+        .unwrap_err();
+        assert!(err.contains("rolled back"), "{err}");
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("app/first.txt")).unwrap(),
+            "original\n",
+            "earlier write in the failed batch must be rolled back"
+        );
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("app/second")).unwrap(),
+            "blocker file\n"
+        );
     }
 }

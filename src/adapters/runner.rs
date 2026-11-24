@@ -560,7 +560,10 @@ fn validate_correlation(
     Ok(())
 }
 
-fn validate_worker_result(result: &WorkerResult, dispatch: &DispatchPacket) -> Result<(), String> {
+pub(super) fn validate_worker_result(
+    result: &WorkerResult,
+    dispatch: &DispatchPacket,
+) -> Result<(), String> {
     result.validate().map_err(|e| e.to_string())?;
     if result.story != dispatch.packet.story || result.task != dispatch.packet.task.spec.id {
         return Err("worker result story/task does not match dispatched task".to_owned());

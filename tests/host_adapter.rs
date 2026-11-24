@@ -182,6 +182,7 @@ struct MockCodexRunner {
     chmod_zero_targets: Mutex<Vec<PathBuf>>,
     observed_exec_paths: Mutex<Vec<Vec<String>>>,
     unbroken_containment: bool,
+    read_root_confinement: bool,
 }
 
 impl MockCodexRunner {
@@ -197,11 +198,17 @@ impl MockCodexRunner {
             chmod_zero_targets: Mutex::new(Vec::new()),
             observed_exec_paths: Mutex::new(Vec::new()),
             unbroken_containment: true,
+            read_root_confinement: true,
         }
     }
 
     fn with_containment(mut self, unbroken: bool) -> Self {
         self.unbroken_containment = unbroken;
+        self
+    }
+
+    fn with_read_root_confinement(mut self, confined: bool) -> Self {
+        self.read_root_confinement = confined;
         self
     }
 
@@ -336,6 +343,10 @@ impl CodexCommandRunner for MockCodexRunner {
 
     fn has_unbroken_containment(&self) -> bool {
         self.unbroken_containment
+    }
+
+    fn has_read_root_confinement(&self) -> bool {
+        self.read_root_confinement
     }
 }
 
@@ -1596,6 +1607,8 @@ fn codex_adapter_detects_permission_changes_and_preserves_contract_on_prompt_tru
 
 #[test]
 fn codex_adapter_enforces_read_scope_and_promotes_only_write_scope() {
+    assert!(!ProcessCommandRunner.has_read_root_confinement());
+
     let fixture = Fixture::new();
     let workdir = fixture.isolated_workdir("wt-read-scope");
     fs::write(workdir.join("app/input.txt"), "allowed context\n").unwrap();
@@ -1606,9 +1619,51 @@ fn codex_adapter_enforces_read_scope_and_promotes_only_write_scope() {
     fs::write(workdir.join("AGENTS.md"), "# Agent guide\n").unwrap();
 
     let clock = FakeClock::at(100);
-    let mut journal = fixture.configured(policy(1, 2), &clock);
+    let mut journal = fixture.configured(policy(1, 3), &clock);
 
     let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+
+    // Without read-root confinement, unscoped/protected entries in workdir fail closed before spawning codex.
+    let unconfined_runner = Arc::new(
+        MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_read_root_confinement(false),
+    );
+    for _ in 0..2 {
+        unconfined_runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        unconfined_runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let unconfined_adapter =
+        CodexAdapter::with_runner(CodexAdapterConfig::default(), unconfined_runner.clone());
+    let cancel = CancelToken::new();
+    let refused = run_task(
+        &mut journal,
+        &unconfined_adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(refused.status, ReconcileStatus::HostUnavailable);
+    assert!(refused.detail.contains("secrets"), "{refused:?}");
+    assert!(refused.detail.contains(".git"), "{refused:?}");
+    assert!(refused.detail.contains("AGENTS.md"), "{refused:?}");
+    // Only version + exec --help probes ran (dispatch + execute); codex exec never launched.
+    assert_eq!(unconfined_runner.calls().len(), 4);
+    assert!(unconfined_runner.observed_exec_paths().is_empty());
+
+    journal
+        .retry_task(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "retry with confined runner",
+            &clock,
+        )
+        .unwrap();
+
+    // When runner enforces read-root confinement, only read_scope entries are staged and only write_scope is promoted.
     let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
     for _ in 0..2 {
         runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
@@ -1617,7 +1672,7 @@ fn codex_adapter_enforces_read_scope_and_promotes_only_write_scope() {
     let result_json = json!({
         "story": STORY,
         "task": "a",
-        "task_revision": 1,
+        "task_revision": task_rev(&journal, "a") + 1,
         "status": "succeeded",
         "report": "wrote allowed file only",
         "commit": null,
@@ -1637,7 +1692,6 @@ fn codex_adapter_enforces_read_scope_and_promotes_only_write_scope() {
     );
 
     let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
-    let cancel = CancelToken::new();
     let report = run_task(
         &mut journal,
         &adapter,
@@ -1664,6 +1718,63 @@ fn codex_adapter_enforces_read_scope_and_promotes_only_write_scope() {
             .iter()
             .any(|p| p.starts_with("secrets") || p.starts_with(".git") || p == "AGENTS.md"),
         "out-of-scope or protected paths must not exist in staged cwd: {staged:?}"
+    );
+}
+
+#[test]
+fn codex_adapter_does_not_promote_writes_when_worker_result_is_invalid() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-invalid-result");
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    // Wrong task_revision triggers WorkerResult::validate failure.
+    let invalid_result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": 999,
+        "status": "succeeded",
+        "report": "wrong revision result",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("app/a.txt", "should not leak to workdir\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&invalid_result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.status, ReconcileStatus::Blocked);
+    assert_eq!(report.code, "invalid_output");
+    assert!(
+        !workdir.join("app/a.txt").exists(),
+        "invalid worker result must not promote staged writes to workdir"
     );
 }
 
@@ -1800,6 +1911,7 @@ fn codex_adapter_reports_unstopped_when_containment_is_escapable() {
 #[ignore]
 fn codex_live_smoke() {
     let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("smoke");
     let clock = SystemClock;
     let mut journal = fixture.configured(policy(1, 1), &clock);
     let adapter = CodexAdapter::new();
@@ -1817,7 +1929,7 @@ fn codex_live_smoke() {
         "a",
         trev,
         "codex-smoke",
-        &fixture.root,
+        &workdir,
         Duration::from_secs(60),
         ExecutionPolicy::ReadOnly,
         &cancel,
