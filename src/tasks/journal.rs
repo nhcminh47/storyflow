@@ -163,6 +163,32 @@ impl TaskJournal {
         &self.view
     }
 
+    pub fn context(&self) -> &RunContext {
+        &self.context
+    }
+
+    pub fn graph_revision(&self) -> u64 {
+        self.graph_revision
+    }
+
+    /// Return the active `TaskGraph` definition from the latest `Define` or `Replace` event.
+    pub fn current_graph(&self) -> TaskResult<Option<TaskGraph>> {
+        if self.view.revision.is_none() {
+            return Ok(None);
+        }
+        let path = self.event_path(self.graph_revision as usize);
+        safe_existing_file(&path)?;
+        let bytes = read_document(&path)?;
+        let record: Record = serde_json::from_slice(&bytes)?;
+        match record.body.event {
+            TaskEvent::Define { graph } | TaskEvent::Replace { graph } => Ok(Some(graph)),
+            _ => Err(error(
+                "task_integrity",
+                "graph revision does not point to a graph event",
+            )),
+        }
+    }
+
     pub fn initialize(&mut self, graph: TaskGraph) -> TaskResult<()> {
         require(
             self.view.revision.is_none(),

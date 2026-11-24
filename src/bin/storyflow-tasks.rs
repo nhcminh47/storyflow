@@ -12,7 +12,10 @@ mod model;
 mod repo;
 
 use std::{env, process::ExitCode};
-use storyflow::tasks::*;
+use storyflow::{
+    integration::{IntegrationCoordinator, IntegrationPhase},
+    tasks::*,
+};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "storyflow-tasks init ID GRAPH.json\n\
@@ -29,29 +32,35 @@ storyflow-tasks finish ID REV ATTEMPT_RESULT.json\n\
 storyflow-tasks cancel ID REV TASK TASK_REV REASON\n\
 storyflow-tasks recover ID REV\n\
 storyflow-tasks stopped ID REV LEASE.json REASON\n\
-storyflow-tasks retry ID REV TASK TASK_REV REASON\n\n\
+storyflow-tasks retry ID REV TASK TASK_REV REASON\n\
+storyflow-tasks worktree ID REV TASK\n\
+storyflow-tasks worktree-remove ID REV TASK\n\
+storyflow-tasks integrate ID REV\n\
+storyflow-tasks integration-status ID\n\n\
 Uses an initialized story's pinned base, scope, stage and current revision.\n\
 Configure opts into durable leases; legacy start/complete are then refused.\n\
 Dispatch reserves a lease; the host launches workers and confirms they stopped.\n\
 Expiry/cancellation/graph replacement do not prove a worker has stopped.\n\
 Replace explicitly publishes a new graph after the story revision changes.\n\
-Never launches a worker, integrates commits or approves a story.\n\
-JSON output except --markdown; success 0, rejected/operational error 2.";
+Worktree provisions an isolated Git worktree for a running task at its base.\n\
+Integrate validates stopped workers, ancestry and scopes into one candidate.\n\
+Never launches a worker or approves a story.\n\
+JSON output except --markdown; success 0, blocked integration 1, error 2.";
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("storyflow-tasks: {error}");
             ExitCode::from(2)
         }
     }
 }
-fn run() -> Result<()> {
+fn run() -> Result<u8> {
     let args: Vec<_> = env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h" | "help") {
         println!("{USAGE}");
-        return Ok(());
+        return Ok(0);
     }
     let [command, id, rest @ ..] = args.as_slice() else {
         return Err(USAGE.into());
@@ -75,6 +84,10 @@ fn run() -> Result<()> {
             | ("recover", [_])
             | ("stopped", [_, _, _])
             | ("retry", [_, _, _, _])
+            | ("worktree", [_, _])
+            | ("worktree-remove", [_, _])
+            | ("integrate", [_])
+            | ("integration-status", [])
     ) || (command == "view" && !(rest.is_empty() || rest == ["--markdown"]))
     {
         return Err(USAGE.into());
@@ -93,6 +106,9 @@ fn run() -> Result<()> {
             | "recover"
             | "stopped"
             | "retry"
+            | "worktree"
+            | "worktree-remove"
+            | "integrate"
     ) {
         rest[0].parse::<u64>()?;
     }
@@ -130,8 +146,9 @@ fn run() -> Result<()> {
         scope: repo::story(&root, &state.base, id)?.scope,
         protected,
     };
-    let mut tasks = TaskJournal::open(&root, context)?;
+    let mut tasks = TaskJournal::open(&root, context.clone())?;
     let clock = SystemClock;
+    let mut exit_code = 0u8;
     let output = match (command.as_str(), rest) {
         ("init", [path]) => {
             tasks.initialize(read_json(path)?)?;
@@ -144,7 +161,7 @@ fn run() -> Result<()> {
         ("view", []) => serde_json::to_value(tasks.view())?,
         ("view", [_]) => {
             print!("{}", tasks.view().markdown());
-            return Ok(());
+            return Ok(0);
         }
         ("packet", [task]) => serde_json::to_value(tasks.packet(task)?)?,
         ("start", [revision, task, task_revision]) => {
@@ -203,13 +220,61 @@ fn run() -> Result<()> {
                 &clock,
             )?)?
         }
+        ("worktree", [revision, task]) => {
+            let rev: u64 = revision.parse()?;
+            if tasks.view().revision != Some(rev) {
+                return Err("stale_task_store_revision: task journal revision changed; read view before retrying".into());
+            }
+            let graph = tasks.current_graph()?;
+            let coordinator = IntegrationCoordinator::new(&root, context)?
+                .with_graph_revision(tasks.graph_revision());
+            serde_json::to_value(coordinator.prepare_worktree(
+                tasks.view(),
+                graph.as_ref(),
+                task,
+            )?)?
+        }
+        ("worktree-remove", [revision, task]) => {
+            let rev: u64 = revision.parse()?;
+            if tasks.view().revision != Some(rev) {
+                return Err("stale_task_store_revision: task journal revision changed; read view before retrying".into());
+            }
+            let graph = tasks.current_graph()?;
+            let coordinator = IntegrationCoordinator::new(&root, context)?
+                .with_graph_revision(tasks.graph_revision());
+            serde_json::to_value(coordinator.cleanup_worktree(
+                tasks.view(),
+                graph.as_ref(),
+                task,
+            )?)?
+        }
+        ("integrate", [revision]) => {
+            let rev: u64 = revision.parse()?;
+            if tasks.view().revision != Some(rev) {
+                return Err("stale_task_store_revision: task journal revision changed; read view before retrying".into());
+            }
+            let graph = tasks.current_graph()?;
+            let coordinator = IntegrationCoordinator::new(&root, context)?
+                .with_graph_revision(tasks.graph_revision());
+            let status = coordinator.integrate(tasks.view(), graph.as_ref())?;
+            if status.phase == IntegrationPhase::Blocked {
+                exit_code = 1;
+            }
+            serde_json::to_value(status)?
+        }
+        ("integration-status", []) => {
+            let graph = tasks.current_graph()?;
+            let coordinator = IntegrationCoordinator::new(&root, context)?
+                .with_graph_revision(tasks.graph_revision());
+            serde_json::to_value(coordinator.status(tasks.view(), graph.as_ref())?)?
+        }
         _ => return Err(USAGE.into()),
     };
     println!("{}", serde_json::to_string_pretty(&output)?);
     // `story` (including run.lock) is retained until after task publication/output.
     drop(tasks);
     drop(story);
-    Ok(())
+    Ok(exit_code)
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
