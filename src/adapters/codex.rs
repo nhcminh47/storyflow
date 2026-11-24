@@ -691,7 +691,16 @@ fn extract_message_from_stdout(stdout: &str, json_output: bool) -> Option<String
 fn build_prompt(request: &AdapterRequest) -> String {
     let packet = &request.dispatch.packet;
     let task = &packet.task;
-    let mut prompt = format!(
+    let constraints = format!(
+        "\nConstraints:\n\
+         - Modify only files inside write_scope.\n\
+         - Never modify .storyflow/ or protected paths.\n\
+         - Never run git push, auto-merge, or claim story approval.\n\
+         - Return ONLY a JSON object with fields: story (\"{}\"), task (\"{}\"), task_revision ({}), status (\"succeeded\"|\"failed\"|\"blocked\"), report (<=4096 bytes), commit (null or 40/64 hex), artifacts (array of {{path, sha256}}).\n",
+        packet.story, task.spec.id, task.revision
+    );
+
+    let mut body = format!(
         "Storyflow task execution request\n\
          Story: {}\n\
          Base commit: {}\n\
@@ -717,36 +726,48 @@ fn build_prompt(request: &AdapterRequest) -> String {
         },
     );
     for ac in &task.spec.acceptance_criteria {
-        prompt.push_str("- ");
-        prompt.push_str(ac);
-        prompt.push('\n');
+        body.push_str("- ");
+        body.push_str(ac);
+        body.push('\n');
     }
     if !packet.prerequisites.is_empty() {
-        prompt.push_str("Completed prerequisites:\n");
+        body.push_str("Completed prerequisites:\n");
         for (dep_id, dep_res) in &packet.prerequisites {
-            prompt.push_str(&format!(
+            body.push_str(&format!(
                 "- {dep_id}: {:?} ({})\n",
                 dep_res.status,
                 dep_res.commit.as_deref().unwrap_or("no-commit")
             ));
         }
     }
-    prompt.push_str(&format!(
-        "\nConstraints:\n\
-         - Modify only files inside write_scope.\n\
-         - Never modify .storyflow/ or protected paths.\n\
-         - Never run git push, auto-merge, or claim story approval.\n\
-         - Return ONLY a JSON object with fields: story (\"{}\"), task (\"{}\"), task_revision ({}), status (\"succeeded\"|\"failed\"|\"blocked\"), report (<=4096 bytes), commit (null or 40/64 hex), artifacts (array of {{path, sha256}}).\n",
-        packet.story, task.spec.id, task.revision
-    ));
-    if prompt.len() > MAX_PROMPT_BYTES {
+
+    let body_budget = MAX_PROMPT_BYTES.saturating_sub(constraints.len());
+    if body.len() > body_budget {
+        const MARKER: &str = "\n...[truncated]...\n";
+        if body_budget >= MARKER.len() {
+            let mut end = body_budget - MARKER.len();
+            while !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            body.truncate(end);
+            body.push_str(MARKER);
+        } else {
+            let mut end = body_budget;
+            while !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            body.truncate(end);
+        }
+    }
+    body.push_str(&constraints);
+    if body.len() > MAX_PROMPT_BYTES {
         let mut end = MAX_PROMPT_BYTES;
-        while !prompt.is_char_boundary(end) {
+        while !body.is_char_boundary(end) {
             end -= 1;
         }
-        prompt.truncate(end);
+        body.truncate(end);
     }
-    prompt
+    body
 }
 
 fn output_schema_json() -> &'static str {
@@ -781,10 +802,31 @@ fn output_schema_json() -> &'static str {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SnapshotEntry {
-    Dir,
-    File { len: u64, sha256: [u8; 32] },
-    LockedFile(u64),
+    Dir {
+        mode: u32,
+    },
+    File {
+        len: u64,
+        sha256: [u8; 32],
+        mode: u32,
+    },
+    LockedFile {
+        len: u64,
+        mode: u32,
+    },
     Symlink(String),
+}
+
+fn entry_mode(meta: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode()
+    }
+    #[cfg(not(unix))]
+    {
+        u32::from(meta.permissions().readonly())
+    }
 }
 
 fn ensure_isolated_workspace(workdir: &Path, write_scope: &[String]) -> Result<(), String> {
@@ -846,9 +888,15 @@ fn collect_snapshot(
                 SnapshotEntry::Symlink(target.to_string_lossy().into_owned()),
             );
         } else if file_type.is_dir() {
-            entries.insert(rel_str, SnapshotEntry::Dir);
+            entries.insert(
+                rel_str,
+                SnapshotEntry::Dir {
+                    mode: entry_mode(&meta),
+                },
+            );
             collect_snapshot(root, &path, entries)?;
         } else if file_type.is_file() {
+            let mode = entry_mode(&meta);
             let mut file = fs::File::open(&path)?;
             let mut hasher = Sha256::new();
             match io::copy(&mut file, &mut hasher) {
@@ -859,6 +907,7 @@ fn collect_snapshot(
                         SnapshotEntry::File {
                             len: meta.len(),
                             sha256,
+                            mode,
                         },
                     );
                 }
@@ -868,7 +917,13 @@ fn collect_snapshot(
                         && rel_str.starts_with(".storyflow/")
                         && (rel_str.ends_with("/tasks.lock") || rel_str.ends_with("/run.lock")) =>
                 {
-                    entries.insert(rel_str, SnapshotEntry::LockedFile(meta.len()));
+                    entries.insert(
+                        rel_str,
+                        SnapshotEntry::LockedFile {
+                            len: meta.len(),
+                            mode,
+                        },
+                    );
                 }
                 Err(err) => return Err(err),
             }
@@ -905,7 +960,7 @@ fn verify_workspace_changes(
             .iter()
             .any(|scope| within_path(&folded_path, &fold_path(scope)));
         let created_parent_for_scope = prev.is_none()
-            && matches!(curr, Some(SnapshotEntry::Dir))
+            && matches!(curr, Some(SnapshotEntry::Dir { .. }))
             && write_scope
                 .iter()
                 .any(|scope| within_path(&fold_path(scope), &folded_path));

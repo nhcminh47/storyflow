@@ -177,6 +177,7 @@ struct MockCodexRunner {
     calls: Mutex<Vec<HostCommandSpec>>,
     write_last_message: Mutex<Option<String>>,
     workspace_mutation: Mutex<Option<(PathBuf, String)>>,
+    permission_mutation: Mutex<Option<PathBuf>>,
 }
 
 impl MockCodexRunner {
@@ -187,6 +188,7 @@ impl MockCodexRunner {
             calls: Mutex::new(Vec::new()),
             write_last_message: Mutex::new(None),
             workspace_mutation: Mutex::new(None),
+            permission_mutation: Mutex::new(None),
         }
     }
 
@@ -219,6 +221,10 @@ impl MockCodexRunner {
     fn set_workspace_mutation(&self, rel_path: &str, content: &str) {
         *self.workspace_mutation.lock().unwrap() =
             Some((PathBuf::from(rel_path), content.to_owned()));
+    }
+
+    fn set_permission_mutation(&self, rel_path: &str) {
+        *self.permission_mutation.lock().unwrap() = Some(PathBuf::from(rel_path));
     }
 
     fn calls(&self) -> Vec<HostCommandSpec> {
@@ -264,6 +270,21 @@ impl CodexCommandRunner for MockCodexRunner {
                     fs::create_dir_all(parent).unwrap();
                 }
                 fs::write(target, content).unwrap();
+            }
+            if let Some(rel) = self.permission_mutation.lock().unwrap().clone() {
+                let target = _cwd.join(rel);
+                let mut perms = fs::metadata(&target).unwrap().permissions();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let flipped = perms.mode() ^ 0o111;
+                    perms.set_mode(flipped);
+                }
+                #[cfg(not(unix))]
+                {
+                    perms.set_readonly(true);
+                }
+                fs::set_permissions(target, perms).unwrap();
             }
             if let Some(msg) = self.write_last_message.lock().unwrap().clone()
                 && let Some(pos) = spec.args.iter().position(|a| a == "--output-last-message")
@@ -1255,6 +1276,92 @@ fn codex_adapter_protects_root_git_metadata_and_resolves_relative_executable() {
         assert!(resolved.is_absolute());
         assert_eq!(resolved, fs::canonicalize(&bin_path).unwrap());
     }
+}
+
+#[test]
+fn codex_adapter_detects_permission_changes_and_preserves_contract_on_prompt_truncation() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-perms");
+    let protected_target = workdir.join("app/b.txt");
+    fs::write(&protected_target, "unchanged content\n").unwrap();
+    let orig_perms = fs::metadata(&protected_target).unwrap().permissions();
+
+    let clock = FakeClock::at(100);
+    let mut big_spec = spec("a", &[]);
+    big_spec.acceptance_criteria = (0..64)
+        .map(|i| format!("AC-{i:02}: {}", "x".repeat(500)))
+        .collect();
+    let big_graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: "1".repeat(40),
+        story_revision: 0,
+        stage: TaskStage::Plan,
+        tasks: vec![big_spec],
+    };
+    let mut journal = TaskJournal::open(&fixture.root, fixture.context.clone()).unwrap();
+    journal.initialize(big_graph).unwrap();
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(1, 2), &clock)
+        .unwrap();
+
+    let sandbox_help = "Usage: codex exec --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": 1,
+        "status": "succeeded",
+        "report": "chmod only",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_permission_mutation("app/b.txt");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    // Restore original permissions before Fixture::drop removes the directory on Windows.
+    fs::set_permissions(&protected_target, orig_perms).unwrap();
+
+    assert_eq!(report.status, ReconcileStatus::Blocked);
+    assert_eq!(report.code, "invalid_output");
+    assert!(report.detail.contains("app/b.txt"));
+
+    // Prompt was truncated to <= 32768 bytes while preserving the full Constraints & JSON contract.
+    let calls = runner.calls();
+    let exec_call = calls.last().unwrap();
+    let prompt_bytes = exec_call.stdin.as_ref().unwrap();
+    assert!(prompt_bytes.len() <= 32_768);
+    let prompt_str = std::str::from_utf8(prompt_bytes).unwrap();
+    assert!(prompt_str.contains("...[truncated]..."));
+    assert!(prompt_str.contains("\nConstraints:\n"));
+    assert!(prompt_str.contains("Return ONLY a JSON object with fields: story"));
 }
 
 #[test]
