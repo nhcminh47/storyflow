@@ -412,6 +412,17 @@ fn parallel_non_overlapping_workers_integrate_into_one_candidate_and_pass_gate_a
     f.tasks(&["finish", STORY, "6", fs_path.to_str().unwrap()]);
     f.tasks(&["worktree-remove", STORY, "7", "summary"]);
 
+    // Run aggressive git gc/prune after worktrees are removed and before integrate runs
+    // to prove that reported task commits and synthesized prerequisite base commits remain pinned.
+    f.git(&[
+        "reflog",
+        "expire",
+        "--expire=now",
+        "--expire-unreachable=now",
+        "--all",
+    ]);
+    f.git(&["gc", "--prune=now", "--quiet"]);
+
     // Integrate all completed tasks in dependency order.
     let integrated = f.tasks(&["integrate", STORY, "7"]);
     assert_eq!(integrated["phase"], "ready");

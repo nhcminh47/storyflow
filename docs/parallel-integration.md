@@ -16,7 +16,7 @@ storyflow-tasks integration-status ID
 | Command | Input and result |
 | --- | --- |
 | `worktree` | Provisions an isolated detached Git worktree under `.storyflow/<id>/worktrees/` for a `running` task at its required base commit, pins `refs/storyflow/<worktree>/<id>/workers/g<graph>/<task>/r<rev>`, and returns `WorkerWorktree`. Idempotent if called again for the same running task revision. |
-| `worktree-remove` | Removes a provisioned worker worktree after confirming the task is no longer running and all worker attempts for that task have `worker_stopped: true`. |
+| `worktree-remove` | Removes a provisioned worker worktree after confirming the task is no longer running and all worker attempts for that task have `worker_stopped: true`. If the task has a recorded result commit, pins `refs/storyflow/<worktree>/<id>/tasks/g<graph>/<task>/r<rev>` before removing the detached worktree. |
 | `integrate` | Validates worker exit, task completion, commit ancestry, base commit, write scope, protected paths and portable namespace in dependency order; integrates commits into one candidate; pins input refs and candidate ref; persists and returns `IntegrationStatus`. |
 | `integration-status` | Returns the current `IntegrationStatus` for the active task graph without mutating Git refs. |
 

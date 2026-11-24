@@ -349,6 +349,12 @@ impl IntegrationCoordinator {
         if let Some(old) = current.worktrees.remove(task_id)
             && self.root.join(&old.path).exists()
         {
+            if let Some(raw_commit) = task.result.as_ref().and_then(|r| r.commit.as_ref())
+                && let Ok(commit) = self.resolve_commit(raw_commit)
+            {
+                let input_ref = self.task_input_ref(old.graph_revision, task_id, old.task_revision);
+                let _ = self.git_checked(&["update-ref", &input_ref, &commit]);
+            }
             let _ = self.remove_git_worktree(&old.path);
         }
         if wt_dir.exists() {
@@ -386,25 +392,35 @@ impl IntegrationCoordinator {
     }
 
     /// Remove a provisioned worker worktree after confirming its worker has exited.
+    /// If the task reported a result commit (or its worktree HEAD has a commit), pins
+    /// the task input ref before removing the detached worktree so Git garbage collection
+    /// or pruning cannot lose the commit before `integrate` runs.
     pub fn cleanup_worktree(
         &self,
         view: &TaskView,
         graph: Option<&TaskGraph>,
         task_id: &str,
     ) -> IntegrationResult<IntegrationStatus> {
-        let _ = view
+        let task = view
             .tasks
             .get(task_id)
             .ok_or_else(|| error("unknown_task", "task does not exist"))?;
         require(
-            !has_unstopped_worker(view, task_id)
-                && view
-                    .tasks
-                    .get(task_id)
-                    .is_none_or(|t| t.status != TaskStatus::Running),
+            !has_unstopped_worker(view, task_id) && task.status != TaskStatus::Running,
             "worker_stop_required",
             "confirm the worker has exited before removing its worktree",
         )?;
+        let graph_rev = self.graph_revision_for(view);
+        if let Some(raw_commit) = task.result.as_ref().and_then(|r| r.commit.as_ref()) {
+            let commit = self.resolve_commit(raw_commit).map_err(|_| {
+                error(
+                    "invalid_task_commit",
+                    format!("task {task_id} commit {raw_commit} does not exist in Git"),
+                )
+            })?;
+            let input_ref = self.task_input_ref(graph_rev, task_id, task.revision);
+            self.git_checked(&["update-ref", &input_ref, &commit])?;
+        }
         let mut current = self.status(view, graph)?;
         if let Some(removed) = current.worktrees.remove(task_id) {
             if self.root.join(&removed.path).exists() {
@@ -413,6 +429,13 @@ impl IntegrationCoordinator {
             self.save_state(&current)?;
         }
         Ok(current)
+    }
+
+    fn task_input_ref(&self, graph_rev: u64, task_id: &str, task_revision: u64) -> String {
+        format!(
+            "refs/storyflow/{}/{}/tasks/g{}/{}/r{}",
+            self.worktree_hash, self.context.story, graph_rev, task_id, task_revision
+        )
     }
 
     /// Validate all tasks in dependency order and integrate their commits into one pinned candidate.
@@ -711,10 +734,7 @@ impl IntegrationCoordinator {
             }
 
             let attempt_id = succeeded_attempt_for_task(view, task_id, task.revision);
-            let input_ref = format!(
-                "refs/storyflow/{}/{}/tasks/g{}/{}/r{}",
-                self.worktree_hash, self.context.story, graph_rev, task_id, task.revision
-            );
+            let input_ref = self.task_input_ref(graph_rev, task_id, task.revision);
             validated.push(ValidatedTask {
                 task_id: task_id.clone(),
                 task_revision: task.revision,
@@ -1034,7 +1054,14 @@ impl IntegrationCoordinator {
                 view.story_revision,
                 graph_rev,
             )? {
-                MergeOutcome::Clean(merged) => running = merged,
+                MergeOutcome::Clean(merged) => {
+                    let prereq_ref = format!(
+                        "refs/storyflow/{}/{}/prereqs/g{}/{}/{}",
+                        self.worktree_hash, self.context.story, graph_rev, task_id, dep_id
+                    );
+                    self.git_checked(&["update-ref", &prereq_ref, &merged])?;
+                    running = merged;
+                }
                 MergeOutcome::Conflict(_) => {
                     return Err(error(
                         "prerequisite_conflict",
