@@ -1090,3 +1090,113 @@ fn merge_conflict_in_same_file_and_state_tampering_are_blocked_and_detected() {
     fs::write(&state_path, original).unwrap();
     assert!(coordinator.load_state().unwrap().is_some());
 }
+
+#[test]
+fn transitive_code_prerequisites_through_read_only_task_are_included_in_task_base() {
+    let f = RepoFixture::new();
+    let ctx = f.init_story_in_implement();
+    let coordinator = IntegrationCoordinator::new(&f.root, ctx.clone()).unwrap();
+
+    // Task A is a code task, Task B is a read-only verification task depending on A,
+    // and Task C is a code task depending on B. Task C's base must include Task A's commit!
+    let graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: f.base.clone(),
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        tasks: vec![
+            task_spec("a", &[], &["messages/welcome.txt"]),
+            task_spec("b-readonly", &["a"], &[]),
+            task_spec("c", &["b-readonly"], &["messages/complete.txt"]),
+        ],
+    };
+    let mut journal = TaskJournal::open(&f.root, ctx.clone()).unwrap();
+    journal.initialize(graph.clone()).unwrap();
+
+    journal.start(0, "a", 0).unwrap();
+    let wt_a = coordinator
+        .prepare_worktree(journal.view(), Some(&graph), "a")
+        .unwrap();
+    let c_a = f.commit_in(
+        &f.root.join(&wt_a.path),
+        &[("messages/welcome.txt", "Welcome from A\n")],
+        "commit a",
+    );
+    journal
+        .complete(
+            1,
+            WorkerResult {
+                schema: 1,
+                story: STORY.into(),
+                task: "a".into(),
+                task_revision: 1,
+                status: ResultStatus::Succeeded,
+                report: "a done".into(),
+                commit: Some(c_a.clone()),
+                artifacts: vec![],
+            },
+        )
+        .unwrap();
+    coordinator
+        .cleanup_worktree(journal.view(), Some(&graph), "a")
+        .unwrap();
+
+    // Complete read-only task B (commit: None).
+    journal.start(2, "b-readonly", 0).unwrap();
+    journal
+        .complete(
+            3,
+            WorkerResult {
+                schema: 1,
+                story: STORY.into(),
+                task: "b-readonly".into(),
+                task_revision: 1,
+                status: ResultStatus::Succeeded,
+                report: "b verified a".into(),
+                commit: None,
+                artifacts: vec![],
+            },
+        )
+        .unwrap();
+
+    // Start task C and verify its provisioned worktree base is `c_a` (not `f.base`).
+    journal.start(4, "c", 0).unwrap();
+    let wt_c = coordinator
+        .prepare_worktree(journal.view(), Some(&graph), "c")
+        .unwrap();
+    assert_eq!(wt_c.base_commit, c_a);
+    let wt_c_dir = f.root.join(&wt_c.path);
+    assert_eq!(
+        fs::read_to_string(wt_c_dir.join("messages/welcome.txt")).unwrap(),
+        "Welcome from A\n"
+    );
+
+    let c_c = f.commit_in(
+        &wt_c_dir,
+        &[("messages/complete.txt", "Complete from C\n")],
+        "commit c",
+    );
+    journal
+        .complete(
+            5,
+            WorkerResult {
+                schema: 1,
+                story: STORY.into(),
+                task: "c".into(),
+                task_revision: 1,
+                status: ResultStatus::Succeeded,
+                report: "c done".into(),
+                commit: Some(c_c.clone()),
+                artifacts: vec![],
+            },
+        )
+        .unwrap();
+    coordinator
+        .cleanup_worktree(journal.view(), Some(&graph), "c")
+        .unwrap();
+
+    let status = coordinator.integrate(journal.view(), Some(&graph)).unwrap();
+    assert_eq!(status.phase, IntegrationPhase::Ready);
+    assert_eq!(status.candidate_commit.as_deref(), Some(c_c.as_str()));
+}

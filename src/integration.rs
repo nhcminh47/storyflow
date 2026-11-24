@@ -301,7 +301,7 @@ impl IntegrationCoordinator {
             "only running tasks can provision an isolated worker worktree",
         )?;
         let attempt_id = active_attempt_for_running_task(view, task_id, task.revision)?;
-        let base_commit = self.expected_task_base(view, task_id)?;
+        let base_commit = self.expected_task_base(view, graph, task_id)?;
 
         let mut current = self.status(view, graph)?;
         // Check for conflicting active worktrees with overlapping write scopes.
@@ -608,7 +608,7 @@ impl IntegrationCoordinator {
                 }
             };
 
-            let expected_base = self.expected_task_base(view, task_id)?;
+            let expected_base = self.expected_task_base(view, graph, task_id)?;
 
             // Commit must descend from the pinned story baseline AND the task's expected base.
             if !self.is_strict_descendant(&self.context.base, &commit)?
@@ -989,20 +989,26 @@ impl IntegrationCoordinator {
     }
 
     /// Determine the required base commit for a task:
-    /// - If the task has no prerequisites with code commits, its base is the pinned story baseline.
-    /// - If the task depends on prerequisites with code commits, its base must either be the
-    ///   pinned story baseline or descend from all prerequisite commits (or if a single code
-    ///   prerequisite exists, that prerequisite's commit).
-    fn expected_task_base(&self, view: &TaskView, task_id: &str) -> IntegrationResult<String> {
-        let task = view
+    /// - If the task has no ancestor prerequisites with code commits, its base is the pinned story baseline.
+    /// - If the task depends (directly or transitively through read-only tasks) on prerequisites
+    ///   with code commits, its base must descend from all ancestor prerequisite commits.
+    fn expected_task_base(
+        &self,
+        view: &TaskView,
+        graph: Option<&TaskGraph>,
+        task_id: &str,
+    ) -> IntegrationResult<String> {
+        let _ = view
             .tasks
             .get(task_id)
             .ok_or_else(|| error("unknown_task", "task does not exist"))?;
+        let ancestors = task_ancestors(view, task_id);
+        let order = dependency_order(view, graph)?;
         let mut dep_commits = Vec::new();
-        for dep_id in &task.spec.prerequisites {
+        for dep_id in order.into_iter().filter(|id| ancestors.contains(id)) {
             let dep = view
                 .tasks
-                .get(dep_id)
+                .get(&dep_id)
                 .ok_or_else(|| error("unknown_task_dependency", "missing prerequisite"))?;
             require(
                 dep.status == TaskStatus::Succeeded,
@@ -1016,7 +1022,7 @@ impl IntegrationCoordinator {
                         format!("prerequisite {dep_id} reported unknown commit {commit}"),
                     )
                 })?;
-                dep_commits.push((dep_id.clone(), resolved));
+                dep_commits.push((dep_id, resolved));
             }
         }
         if dep_commits.is_empty() {
@@ -1026,8 +1032,7 @@ impl IntegrationCoordinator {
             return Ok(dep_commits[0].1.clone());
         }
         // Multiple code prerequisites: if one prerequisite commit already descends from all others,
-        // use it; otherwise if a previously integrated commit for those prerequisites exists, use it;
-        // otherwise synthesize/verify a clean prerequisite base commit.
+        // use it; otherwise synthesize/verify a clean prerequisite base commit in dependency order.
         for (_, candidate) in &dep_commits {
             if dep_commits.iter().all(|(_, other)| {
                 candidate == other || self.is_ancestor(other, candidate).unwrap_or(false)
