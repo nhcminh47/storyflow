@@ -178,6 +178,10 @@ struct MockCodexRunner {
     write_last_message: Mutex<Option<String>>,
     workspace_mutation: Mutex<Option<(PathBuf, String)>>,
     permission_mutation: Mutex<Option<PathBuf>>,
+    #[cfg(unix)]
+    chmod_zero_targets: Mutex<Vec<PathBuf>>,
+    observed_exec_paths: Mutex<Vec<Vec<String>>>,
+    unbroken_containment: bool,
 }
 
 impl MockCodexRunner {
@@ -189,7 +193,16 @@ impl MockCodexRunner {
             write_last_message: Mutex::new(None),
             workspace_mutation: Mutex::new(None),
             permission_mutation: Mutex::new(None),
+            #[cfg(unix)]
+            chmod_zero_targets: Mutex::new(Vec::new()),
+            observed_exec_paths: Mutex::new(Vec::new()),
+            unbroken_containment: true,
         }
+    }
+
+    fn with_containment(mut self, unbroken: bool) -> Self {
+        self.unbroken_containment = unbroken;
+        self
     }
 
     fn push_ok(&self, code: i32, stdout: &str, stderr: &str, timed_out: bool, cancelled: bool) {
@@ -225,6 +238,15 @@ impl MockCodexRunner {
 
     fn set_permission_mutation(&self, rel_path: &str) {
         *self.permission_mutation.lock().unwrap() = Some(PathBuf::from(rel_path));
+    }
+
+    #[cfg(unix)]
+    fn set_chmod_zero_targets(&self, rel_paths: &[&str]) {
+        *self.chmod_zero_targets.lock().unwrap() = rel_paths.iter().map(PathBuf::from).collect();
+    }
+
+    fn observed_exec_paths(&self) -> Vec<Vec<String>> {
+        self.observed_exec_paths.lock().unwrap().clone()
     }
 
     fn calls(&self) -> Vec<HostCommandSpec> {
@@ -264,6 +286,10 @@ impl CodexCommandRunner for MockCodexRunner {
         if spec.args.first().map(String::as_str) == Some("exec")
             && spec.args.get(1).map(String::as_str) != Some("--help")
         {
+            let mut seen = Vec::new();
+            collect_rel_paths(_cwd, _cwd, &mut seen);
+            self.observed_exec_paths.lock().unwrap().push(seen);
+
             if let Some((rel, content)) = self.workspace_mutation.lock().unwrap().clone() {
                 let target = _cwd.join(rel);
                 if let Some(parent) = target.parent() {
@@ -286,6 +312,16 @@ impl CodexCommandRunner for MockCodexRunner {
                 }
                 fs::set_permissions(target, perms).unwrap();
             }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for rel in self.chmod_zero_targets.lock().unwrap().clone() {
+                    let target = _cwd.join(rel);
+                    let mut perms = fs::metadata(&target).unwrap().permissions();
+                    perms.set_mode(0o000);
+                    fs::set_permissions(target, perms).unwrap();
+                }
+            }
             if let Some(msg) = self.write_last_message.lock().unwrap().clone()
                 && let Some(pos) = spec.args.iter().position(|a| a == "--output-last-message")
                 && let Some(path) = spec.args.get(pos + 1)
@@ -296,6 +332,31 @@ impl CodexCommandRunner for MockCodexRunner {
         let mut queue = self.responses.lock().unwrap();
         assert!(!queue.is_empty(), "unexpected runner call: {:?}", spec.args);
         queue.remove(0)
+    }
+
+    fn has_unbroken_containment(&self) -> bool {
+        self.unbroken_containment
+    }
+}
+
+fn collect_rel_paths(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<_> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        if let Ok(rel) = path.strip_prefix(root) {
+            out.push(
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
+        }
+        if path.is_dir() {
+            collect_rel_paths(root, &path, out);
+        }
     }
 }
 
@@ -1531,6 +1592,208 @@ fn codex_adapter_detects_permission_changes_and_preserves_contract_on_prompt_tru
     assert!(big_prompt.contains("...[prerequisites truncated]..."));
     assert!(big_prompt.contains("\nConstraints:\n"));
     assert!(big_prompt.contains("Return ONLY a JSON object with fields: story"));
+}
+
+#[test]
+fn codex_adapter_enforces_read_scope_and_promotes_only_write_scope() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-read-scope");
+    fs::write(workdir.join("app/input.txt"), "allowed context\n").unwrap();
+    fs::create_dir_all(workdir.join("secrets")).unwrap();
+    fs::write(workdir.join("secrets/token.txt"), "top-secret-token\n").unwrap();
+    fs::create_dir_all(workdir.join(".git")).unwrap();
+    fs::write(workdir.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+    fs::write(workdir.join("AGENTS.md"), "# Agent guide\n").unwrap();
+
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": 1,
+        "status": "succeeded",
+        "report": "wrote allowed file only",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("app/a.txt", "promoted change\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.status, ReconcileStatus::Applied, "{report:?}");
+    assert_eq!(
+        fs::read_to_string(workdir.join("app/a.txt")).unwrap(),
+        "promoted change\n"
+    );
+
+    let seen = runner.observed_exec_paths();
+    assert_eq!(seen.len(), 1);
+    let staged = &seen[0];
+    assert!(staged.contains(&"app/input.txt".to_owned()), "{staged:?}");
+    assert!(
+        !staged
+            .iter()
+            .any(|p| p.starts_with("secrets") || p.starts_with(".git") || p == "AGENTS.md"),
+        "out-of-scope or protected paths must not exist in staged cwd: {staged:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_adapter_recovers_unreadable_post_run_mutations() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-chmod-zero");
+    fs::write(workdir.join("app/b.txt"), "protected content\n").unwrap();
+    fs::create_dir_all(workdir.join("app/locked_dir")).unwrap();
+    fs::write(workdir.join("app/locked_dir/nested.txt"), "nested\n").unwrap();
+
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": 1,
+        "status": "succeeded",
+        "report": "chmod 000 out of scope paths",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_chmod_zero_targets(&["app/b.txt", "app/locked_dir"]);
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.status, ReconcileStatus::Blocked);
+    assert_eq!(report.code, "invalid_output");
+    assert!(report.detail.contains("restored"), "{}", report.detail);
+    assert!(report.detail.contains("app/b.txt"), "{}", report.detail);
+    assert!(
+        report.detail.contains("app/locked_dir"),
+        "{}",
+        report.detail
+    );
+}
+
+#[test]
+fn codex_adapter_reports_unstopped_when_containment_is_escapable() {
+    assert_eq!(
+        ProcessCommandRunner.has_unbroken_containment(),
+        cfg!(windows)
+    );
+
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-escapable");
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_containment(false));
+    for _ in 0..3 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": 1,
+        "status": "succeeded",
+        "report": "completed while descendants unconfirmed",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("app/a.txt", "should not be promoted\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let caps = adapter.probe();
+    assert!(caps.available);
+    assert!(!caps.supports_cancel);
+
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.status, ReconcileStatus::BlockedUnstopped);
+    assert!(!report.worker_stopped);
+    assert!(!report.recoverable);
+    assert!(
+        !workdir.join("app/a.txt").exists(),
+        "unconfirmed worker writes must not be promoted to workdir"
+    );
 }
 
 #[test]

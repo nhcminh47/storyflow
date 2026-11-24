@@ -69,6 +69,12 @@ pub trait CodexCommandRunner: Send + Sync {
         cwd: &Path,
         should_stop: &dyn Fn() -> bool,
     ) -> Result<ControlledResult, ProcessError>;
+
+    /// Returns `true` only if the runner's OS containment guarantees that no
+    /// detached descendant process can survive after termination is reported.
+    fn has_unbroken_containment(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Default)]
@@ -111,6 +117,12 @@ impl CodexCommandRunner for ProcessCommandRunner {
         should_stop: &dyn Fn() -> bool,
     ) -> Result<ControlledResult, ProcessError> {
         run_host_command(spec, cwd, should_stop)
+    }
+
+    fn has_unbroken_containment(&self) -> bool {
+        // Windows Job Objects track all descendants regardless of session/group changes;
+        // Unix process-group cleanup can be escaped via setsid().
+        cfg!(windows)
     }
 }
 
@@ -300,7 +312,12 @@ impl HostAdapter for CodexAdapter {
             }
         };
 
-        parse_exec_help(&exe_str, version, &help_text)
+        parse_exec_help(
+            &exe_str,
+            version,
+            &help_text,
+            self.runner.has_unbroken_containment(),
+        )
     }
 
     fn execute(&self, request: &AdapterRequest, cancel: &CancelToken) -> AdapterOutcome {
@@ -352,30 +369,6 @@ impl HostAdapter for CodexAdapter {
             };
         }
 
-        let before_snapshot =
-            match snapshot_workspace(&request.workdir, true, self.config.max_backup_bytes) {
-                Ok(snapshot) => snapshot,
-                Err(err) => {
-                    return AdapterOutcome::HostCrashed {
-                        correlation: fallback_correlation,
-                        worker_stopped: true,
-                        exit_code: None,
-                        detail: sanitize_reason(&format!(
-                            "failed to snapshot codex workspace before execution: {err}"
-                        )),
-                    };
-                }
-            };
-        if request.policy == ExecutionPolicy::WorkspaceWrite && before_snapshot.incomplete_backup {
-            return AdapterOutcome::HostUnavailable {
-                provider: "codex".to_owned(),
-                detail: format!(
-                    "workspace exceeds {} byte rollback backup limit for WorkspaceWrite; use a clean isolated worktree",
-                    self.config.max_backup_bytes
-                ),
-            };
-        }
-
         let prompt = match build_prompt(request) {
             Ok(prompt) => prompt,
             Err(err) => {
@@ -396,6 +389,70 @@ impl HostAdapter for CodexAdapter {
                 };
             }
         };
+
+        let staging_dir = match TempArtifactsDir::new() {
+            Ok(dir) => dir,
+            Err(err) => {
+                return AdapterOutcome::HostCrashed {
+                    correlation: fallback_correlation,
+                    worker_stopped: true,
+                    exit_code: None,
+                    detail: format!("failed to create codex staging directory: {err}"),
+                };
+            }
+        };
+        if let Err(err) = stage_read_scope(
+            &request.workdir,
+            staging_dir.path(),
+            &request.dispatch.packet.task.spec.read_scope,
+            self.config.max_backup_bytes,
+        ) {
+            return match err {
+                StageError::BudgetExceeded => AdapterOutcome::HostUnavailable {
+                    provider: "codex".to_owned(),
+                    detail: format!(
+                        "read_scope exceeds {} byte rollback backup limit for staged execution; narrow task read_scope",
+                        self.config.max_backup_bytes
+                    ),
+                },
+                StageError::SymlinkOrSpecial(detail) => AdapterOutcome::HostUnavailable {
+                    provider: "codex".to_owned(),
+                    detail: sanitize_reason(&detail),
+                },
+                StageError::Io(detail) => AdapterOutcome::HostCrashed {
+                    correlation: fallback_correlation,
+                    worker_stopped: true,
+                    exit_code: None,
+                    detail: sanitize_reason(&format!(
+                        "failed to stage codex read_scope workspace: {detail}"
+                    )),
+                },
+            };
+        }
+
+        let before_snapshot =
+            match snapshot_workspace(staging_dir.path(), true, self.config.max_backup_bytes) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    return AdapterOutcome::HostCrashed {
+                        correlation: fallback_correlation,
+                        worker_stopped: true,
+                        exit_code: None,
+                        detail: sanitize_reason(&format!(
+                            "failed to snapshot codex staging workspace before execution: {err}"
+                        )),
+                    };
+                }
+            };
+        if request.policy == ExecutionPolicy::WorkspaceWrite && before_snapshot.incomplete_backup {
+            return AdapterOutcome::HostUnavailable {
+                provider: "codex".to_owned(),
+                detail: format!(
+                    "workspace exceeds {} byte rollback backup limit for WorkspaceWrite; use a clean isolated worktree",
+                    self.config.max_backup_bytes
+                ),
+            };
+        }
 
         let temp_dir = match TempArtifactsDir::new() {
             Ok(dir) => dir,
@@ -425,7 +482,7 @@ impl HostAdapter for CodexAdapter {
         let mut args = vec!["exec".to_owned()];
         if caps.supports_working_dir {
             args.push("--cd".to_owned());
-            args.push(request.workdir.to_string_lossy().into_owned());
+            args.push(staging_dir.path().to_string_lossy().into_owned());
         }
         args.push("--sandbox".to_owned());
         args.push(match request.policy {
@@ -466,7 +523,7 @@ impl HostAdapter for CodexAdapter {
 
         let controlled = match self
             .runner
-            .run(&spec, &request.workdir, &|| cancel.is_cancelled())
+            .run(&spec, staging_dir.path(), &|| cancel.is_cancelled())
         {
             Ok(result) => result,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -487,6 +544,7 @@ impl HostAdapter for CodexAdapter {
             }
         };
 
+        let worker_stopped = self.runner.has_unbroken_containment();
         let stdout_text = String::from_utf8_lossy(&controlled.process.stdout);
         let stderr_text = String::from_utf8_lossy(&controlled.process.stderr);
         let session_id = extract_session_id(&stdout_text)
@@ -494,7 +552,7 @@ impl HostAdapter for CodexAdapter {
         let correlation = SessionCorrelation::from_lease(&request.dispatch.lease, session_id);
 
         let scope_check = verify_and_restore_post_run(
-            &request.workdir,
+            staging_dir.path(),
             &before_snapshot,
             request.policy,
             &request.dispatch.packet.task.spec.write_scope,
@@ -502,24 +560,24 @@ impl HostAdapter for CodexAdapter {
 
         if controlled.cancelled {
             let reason = match scope_check {
-                Ok(()) => "cancelled by host request".to_owned(),
+                Ok(_) => "cancelled by host request".to_owned(),
                 Err(msg) => sanitize_reason(&format!("cancelled by host request ({msg})")),
             };
             return AdapterOutcome::Cancelled {
                 correlation,
-                worker_stopped: true,
+                worker_stopped,
                 reason,
             };
         }
 
         if controlled.process.timed_out {
             let reason = match scope_check {
-                Ok(()) => "codex execution timed out".to_owned(),
+                Ok(_) => "codex execution timed out".to_owned(),
                 Err(msg) => sanitize_reason(&format!("codex execution timed out ({msg})")),
             };
             return AdapterOutcome::TimedOut {
                 correlation,
-                worker_stopped: true,
+                worker_stopped,
                 reason,
             };
         }
@@ -533,24 +591,27 @@ impl HostAdapter for CodexAdapter {
             };
             let base = format!("codex exited unsuccessfully: {detail_source}");
             let detail = match scope_check {
-                Ok(()) => sanitize_reason(&base),
+                Ok(_) => sanitize_reason(&base),
                 Err(msg) => sanitize_reason(&format!("{base}; {msg}")),
             };
             return AdapterOutcome::HostCrashed {
                 correlation,
-                worker_stopped: true,
+                worker_stopped,
                 exit_code,
                 detail,
             };
         }
 
-        if let Err(detail) = scope_check {
-            return AdapterOutcome::InvalidOutput {
-                correlation,
-                worker_stopped: true,
-                detail: sanitize_reason(&detail),
-            };
-        }
+        let after_snapshot = match scope_check {
+            Ok(snapshot) => snapshot,
+            Err(detail) => {
+                return AdapterOutcome::InvalidOutput {
+                    correlation,
+                    worker_stopped,
+                    detail: sanitize_reason(&detail),
+                };
+            }
+        };
 
         let payload = if caps.supports_output_file {
             match read_last_message_file(&output_path) {
@@ -559,7 +620,7 @@ impl HostAdapter for CodexAdapter {
                 Err(detail) => {
                     return AdapterOutcome::InvalidOutput {
                         correlation,
-                        worker_stopped: true,
+                        worker_stopped,
                         detail,
                     };
                 }
@@ -571,7 +632,7 @@ impl HostAdapter for CodexAdapter {
         let Some(raw_json) = payload else {
             return AdapterOutcome::InvalidOutput {
                 correlation,
-                worker_stopped: true,
+                worker_stopped,
                 detail: "codex produced no structured result payload".to_owned(),
             };
         };
@@ -581,11 +642,28 @@ impl HostAdapter for CodexAdapter {
             Err(err) => {
                 return AdapterOutcome::InvalidOutput {
                     correlation,
-                    worker_stopped: true,
+                    worker_stopped,
                     detail: sanitize_reason(&format!("invalid codex JSON result: {err}")),
                 };
             }
         };
+
+        if worker_stopped
+            && request.policy == ExecutionPolicy::WorkspaceWrite
+            && let Err(detail) = apply_staged_writes(
+                staging_dir.path(),
+                &request.workdir,
+                &before_snapshot,
+                &after_snapshot,
+                &request.dispatch.packet.task.spec.write_scope,
+            )
+        {
+            return AdapterOutcome::InvalidOutput {
+                correlation,
+                worker_stopped,
+                detail: sanitize_reason(&detail),
+            };
+        }
 
         AdapterOutcome::Completed {
             correlation,
@@ -599,7 +677,7 @@ impl HostAdapter for CodexAdapter {
                 commit: envelope.commit,
                 artifacts: envelope.artifacts,
             },
-            worker_stopped: true,
+            worker_stopped,
         }
     }
 }
@@ -616,7 +694,12 @@ struct CodexResultEnvelope {
     artifacts: Vec<Artifact>,
 }
 
-fn parse_exec_help(exe: &str, version: Option<String>, help_text: &str) -> HostCapabilities {
+fn parse_exec_help(
+    exe: &str,
+    version: Option<String>,
+    help_text: &str,
+    supports_cancel: bool,
+) -> HostCapabilities {
     let mut detected = BTreeSet::new();
     for token in help_text.split(|c: char| {
         c.is_whitespace() || matches!(c, ',' | '[' | ']' | '(' | ')' | '=' | '<' | '>' | ':')
@@ -648,7 +731,7 @@ fn parse_exec_help(exe: &str, version: Option<String>, help_text: &str) -> HostC
         supports_output_file,
         supports_working_dir,
         supports_sandbox_flag,
-        supports_cancel: true,
+        supports_cancel,
         supports_session_id: supports_json_output,
         supports_stdin_prompt,
         detected_flags: detected.into_iter().collect(),
@@ -857,6 +940,322 @@ enum SnapshotEntry {
         mode: u32,
     },
     Symlink(String),
+    Unreadable,
+}
+
+enum StageError {
+    BudgetExceeded,
+    SymlinkOrSpecial(String),
+    Io(String),
+}
+
+fn stage_read_scope(
+    workdir: &Path,
+    staging_root: &Path,
+    read_scope: &[String],
+    max_bytes: usize,
+) -> Result<(), StageError> {
+    let folded_scopes: Vec<String> = read_scope.iter().map(|s| fold_path(s)).collect();
+    if folded_scopes.is_empty() {
+        return Ok(());
+    }
+    let mut copied_bytes = 0usize;
+    let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+    stage_dir_entries(
+        workdir,
+        workdir,
+        staging_root,
+        &folded_scopes,
+        max_bytes,
+        &mut copied_bytes,
+        &mut dir_modes,
+    )?;
+    for (dir_path, mode) in dir_modes.into_iter().rev() {
+        restore_mode(&dir_path, mode).map_err(|err| StageError::Io(err.to_string()))?;
+    }
+    Ok(())
+}
+
+fn stage_dir_entries(
+    workdir: &Path,
+    dir: &Path,
+    staging_root: &Path,
+    folded_scopes: &[String],
+    max_bytes: usize,
+    copied_bytes: &mut usize,
+    dir_modes: &mut Vec<(PathBuf, u32)>,
+) -> Result<(), StageError> {
+    let mut children: Vec<_> = fs::read_dir(dir)
+        .map_err(|err| StageError::Io(err.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| StageError::Io(err.to_string()))?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let path = child.path();
+        let rel = path
+            .strip_prefix(workdir)
+            .map_err(|_| StageError::Io("workspace path escaped root".to_owned()))?;
+        let rel_str = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if rel_str.is_empty() || is_protected_path(&rel_str) {
+            continue;
+        }
+        let folded = fold_path(&rel_str);
+        let in_read = folded_scopes
+            .iter()
+            .any(|scope| within_path(&folded, scope));
+        let is_ancestor = folded_scopes
+            .iter()
+            .any(|scope| within_path(scope, &folded));
+        if !in_read && !is_ancestor {
+            continue;
+        }
+
+        let meta = fs::symlink_metadata(&path).map_err(|err| StageError::Io(err.to_string()))?;
+        let file_type = meta.file_type();
+        let target = staging_root.join(&rel_str);
+        if file_type.is_symlink() {
+            return Err(StageError::SymlinkOrSpecial(format!(
+                "refusing symlink in codex read_scope: {rel_str}"
+            )));
+        } else if file_type.is_dir() {
+            fs::create_dir_all(&target).map_err(|err| StageError::Io(err.to_string()))?;
+            dir_modes.push((target, entry_mode(&meta)));
+            stage_dir_entries(
+                workdir,
+                &path,
+                staging_root,
+                folded_scopes,
+                max_bytes,
+                copied_bytes,
+                dir_modes,
+            )?;
+        } else if file_type.is_file() {
+            if !in_read {
+                continue;
+            }
+            let next_bytes = usize::try_from(meta.len())
+                .ok()
+                .and_then(|len| copied_bytes.checked_add(len))
+                .filter(|total| *total <= max_bytes);
+            let Some(new_total) = next_bytes else {
+                return Err(StageError::BudgetExceeded);
+            };
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|err| StageError::Io(err.to_string()))?;
+            }
+            let bytes = fs::read(&path).map_err(|err| StageError::Io(err.to_string()))?;
+            fs::write(&target, &bytes).map_err(|err| StageError::Io(err.to_string()))?;
+            restore_mode(&target, entry_mode(&meta))
+                .map_err(|err| StageError::Io(err.to_string()))?;
+            *copied_bytes = new_total;
+        } else {
+            return Err(StageError::SymlinkOrSpecial(format!(
+                "unsupported special file in codex read_scope: {rel_str}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn apply_staged_writes(
+    staging_root: &Path,
+    workdir: &Path,
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+    write_scope: &[String],
+) -> Result<(), String> {
+    enum StagedWriteOp {
+        RemoveFile {
+            rel: String,
+        },
+        RemoveDir {
+            rel: String,
+        },
+        EnsureDir {
+            rel: String,
+            mode: u32,
+        },
+        WriteFile {
+            rel: String,
+            bytes: Vec<u8>,
+            mode: u32,
+        },
+    }
+
+    let all_paths: BTreeSet<&String> = before.entries.keys().chain(after.entries.keys()).collect();
+    let mut ops = Vec::new();
+
+    for path in all_paths {
+        let prev = before.entries.get(path);
+        let curr = after.entries.get(path);
+        if prev == curr {
+            continue;
+        }
+        if is_protected_path(path) {
+            return Err(format!(
+                "refusing protected path promotion from staging: {path}"
+            ));
+        }
+        let folded_path = fold_path(path);
+        let in_write_scope = write_scope
+            .iter()
+            .any(|scope| within_path(&folded_path, &fold_path(scope)));
+        let created_parent_for_scope = prev.is_none()
+            && matches!(curr, Some(SnapshotEntry::Dir { .. }))
+            && write_scope
+                .iter()
+                .any(|scope| within_path(&fold_path(scope), &folded_path));
+        if !in_write_scope && !created_parent_for_scope {
+            return Err(format!(
+                "refusing out-of-scope promotion from staging: {path}"
+            ));
+        }
+        ensure_no_symlink_components(workdir, path)?;
+
+        let staged_path = staging_root.join(path);
+        match (prev, curr) {
+            (_, Some(SnapshotEntry::Symlink(_)))
+            | (_, Some(SnapshotEntry::Unreadable))
+            | (_, Some(SnapshotEntry::LockedFile { .. })) => {
+                return Err(format!(
+                    "refusing unsafe staged entry in write_scope: {path}"
+                ));
+            }
+            (_, Some(SnapshotEntry::File { mode, .. })) => {
+                let bytes = fs::read(&staged_path).map_err(|err| {
+                    format!("failed to read staged output {path} before promotion: {err}")
+                })?;
+                ops.push(StagedWriteOp::WriteFile {
+                    rel: path.clone(),
+                    bytes,
+                    mode: *mode,
+                });
+            }
+            (_, Some(SnapshotEntry::Dir { mode })) => {
+                ops.push(StagedWriteOp::EnsureDir {
+                    rel: path.clone(),
+                    mode: *mode,
+                });
+            }
+            (Some(SnapshotEntry::File { .. }), None) => {
+                ops.push(StagedWriteOp::RemoveFile { rel: path.clone() });
+            }
+            (Some(SnapshotEntry::Dir { .. }), None) => {
+                ops.push(StagedWriteOp::RemoveDir { rel: path.clone() });
+            }
+            (
+                None
+                | Some(
+                    SnapshotEntry::Symlink(_)
+                    | SnapshotEntry::LockedFile { .. }
+                    | SnapshotEntry::Unreadable,
+                ),
+                None,
+            ) => {}
+        }
+    }
+
+    // Apply removals deepest-first, then directory creation shallowest-first, then file writes.
+    for op in ops.iter().rev() {
+        if let StagedWriteOp::RemoveFile { rel } = op {
+            let target = workdir.join(rel);
+            match fs::symlink_metadata(&target) {
+                Ok(meta) if meta.file_type().is_file() => {
+                    remove_file_or_symlink(&target)
+                        .map_err(|err| format!("failed to remove {rel}: {err}"))?;
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "refusing non-regular file removal in workdir: {rel}"
+                    ));
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("failed to inspect {rel} in workdir: {err}")),
+            }
+        }
+    }
+    for op in ops.iter().rev() {
+        if let StagedWriteOp::RemoveDir { rel } = op {
+            let target = workdir.join(rel);
+            remove_dir_if_present(&target)
+                .map_err(|err| format!("failed to remove directory {rel}: {err}"))?;
+        }
+    }
+    for op in &ops {
+        if let StagedWriteOp::EnsureDir { rel, .. } = op {
+            let target = workdir.join(rel);
+            if let Ok(meta) = fs::symlink_metadata(&target)
+                && !meta.file_type().is_dir()
+            {
+                if meta.file_type().is_file() {
+                    remove_file_or_symlink(&target)
+                        .map_err(|err| format!("failed to replace file {rel} with dir: {err}"))?;
+                } else {
+                    return Err(format!("refusing to overwrite non-file entry {rel}"));
+                }
+            }
+            fs::create_dir_all(&target)
+                .map_err(|err| format!("failed to create directory {rel}: {err}"))?;
+        }
+    }
+    for op in &ops {
+        if let StagedWriteOp::WriteFile { rel, bytes, mode } = op {
+            let target = workdir.join(rel);
+            if let Ok(meta) = fs::symlink_metadata(&target)
+                && meta.file_type().is_dir()
+            {
+                remove_dir_if_present(&target)
+                    .map_err(|err| format!("failed to replace dir {rel} with file: {err}"))?;
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("failed to create parent directory for {rel}: {err}"))?;
+            }
+            make_writable_if_exists(&target)
+                .and_then(|()| fs::write(&target, bytes))
+                .and_then(|()| restore_mode(&target, *mode))
+                .map_err(|err| format!("failed to write staged file {rel}: {err}"))?;
+        }
+    }
+    for op in ops.iter().rev() {
+        if let StagedWriteOp::EnsureDir { rel, mode } = op {
+            let target = workdir.join(rel);
+            restore_mode(&target, *mode)
+                .map_err(|err| format!("failed to set directory permissions for {rel}: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_symlink_components(workdir: &Path, rel_path: &str) -> Result<(), String> {
+    let mut cur = workdir.to_path_buf();
+    for component in Path::new(rel_path).components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(format!(
+                "invalid path component in staged write: {rel_path}"
+            ));
+        };
+        cur.push(part);
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing to promote write through symlink in workdir: {rel_path}"
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(format!(
+                    "failed to inspect workdir path before promoting {rel_path}: {err}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn entry_mode(meta: &fs::Metadata) -> u32 {
@@ -948,16 +1347,32 @@ fn collect_snapshot(
                 SnapshotEntry::Symlink(target.to_string_lossy().into_owned()),
             );
         } else if file_type.is_dir() {
+            let dir_entry_idx = rel_str.clone();
             snapshot.entries.insert(
                 rel_str,
                 SnapshotEntry::Dir {
                     mode: entry_mode(&meta),
                 },
             );
-            collect_snapshot(root, &path, capture_backups, max_backup_bytes, snapshot)?;
+            match collect_snapshot(root, &path, capture_backups, max_backup_bytes, snapshot) {
+                Ok(()) => {}
+                Err(err) if !capture_backups && err.kind() == io::ErrorKind::PermissionDenied => {
+                    snapshot
+                        .entries
+                        .insert(dir_entry_idx, SnapshotEntry::Unreadable);
+                }
+                Err(err) => return Err(err),
+            }
         } else if file_type.is_file() {
             let mode = entry_mode(&meta);
-            let mut file = fs::File::open(&path)?;
+            let mut file = match fs::File::open(&path) {
+                Ok(file) => file,
+                Err(err) if !capture_backups && err.kind() == io::ErrorKind::PermissionDenied => {
+                    snapshot.entries.insert(rel_str, SnapshotEntry::Unreadable);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let mut hasher = Sha256::new();
             let store_backup = capture_backups
                 && usize::try_from(meta.len())
@@ -1015,6 +1430,11 @@ fn collect_snapshot(
                         );
                     }
                     Err(err)
+                        if !capture_backups && err.kind() == io::ErrorKind::PermissionDenied =>
+                    {
+                        snapshot.entries.insert(rel_str, SnapshotEntry::Unreadable);
+                    }
+                    Err(err)
                         if cfg!(windows)
                             && err.raw_os_error() == Some(33)
                             && rel_str.starts_with(".storyflow/")
@@ -1047,9 +1467,26 @@ fn verify_and_restore_post_run(
     before: &WorkspaceSnapshot,
     policy: ExecutionPolicy,
     write_scope: &[String],
-) -> Result<(), String> {
-    let after = snapshot_workspace(root, false, 0)
-        .map_err(|err| format!("failed to verify codex workspace changes: {err}"))?;
+) -> Result<WorkspaceSnapshot, String> {
+    let after = match snapshot_workspace(root, false, 0) {
+        Ok(after) => after,
+        Err(err) => {
+            let rollback_errors = restore_all_before_entries(root, before);
+            if rollback_errors.is_empty() {
+                return Err(format!(
+                    "failed to verify codex workspace changes (restored pre-run snapshot): {err}"
+                ));
+            }
+            let err_sample = rollback_errors
+                .into_iter()
+                .take(8)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!(
+                "failed to verify codex workspace changes (rollback failed: {err_sample}): {err}"
+            ));
+        }
+    };
     let all_paths: BTreeSet<&String> = before.entries.keys().chain(after.entries.keys()).collect();
     let mut violations = Vec::new();
     for path in all_paths {
@@ -1076,7 +1513,7 @@ fn verify_and_restore_post_run(
         }
     }
     if violations.is_empty() {
-        return Ok(());
+        return Ok(after);
     }
 
     let rollback_errors = restore_violations(root, &violations, before, &after);
@@ -1101,6 +1538,34 @@ fn verify_and_restore_post_run(
     }
 }
 
+fn restore_all_before_entries(root: &Path, before: &WorkspaceSnapshot) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Err(err) = make_dir_accessible(root) {
+        errors.push(format!("root: {err}"));
+    }
+    let all_before: Vec<String> = before.entries.keys().cloned().collect();
+    for path in &all_before {
+        if let Some(SnapshotEntry::Dir { .. }) = before.entries.get(path) {
+            let full = root.join(path);
+            if let Err(err) = make_dir_accessible(&full) {
+                errors.push(format!("{path}: {err}"));
+            }
+        }
+    }
+    errors.extend(restore_violations(
+        root,
+        &all_before,
+        before,
+        &WorkspaceSnapshot {
+            entries: BTreeMap::new(),
+            backups: BTreeMap::new(),
+            backup_bytes: 0,
+            incomplete_backup: false,
+        },
+    ));
+    errors
+}
+
 fn restore_violations(
     root: &Path,
     violations: &[String],
@@ -1108,6 +1573,22 @@ fn restore_violations(
     after: &WorkspaceSnapshot,
 ) -> Vec<String> {
     let mut errors = Vec::new();
+
+    // 0. Ensure root and traversed directories are writable/searchable before fixing entries.
+    if let Err(err) = make_dir_accessible(root) {
+        errors.push(format!("root: {err}"));
+    }
+    for path in violations {
+        let full = root.join(path);
+        if matches!(before.entries.get(path), Some(SnapshotEntry::Dir { .. }))
+            || matches!(
+                after.entries.get(path),
+                Some(SnapshotEntry::Dir { .. } | SnapshotEntry::Unreadable)
+            )
+        {
+            let _ = make_dir_accessible(&full);
+        }
+    }
 
     // 1. Remove added or type-changed non-directory entries first, then added directories deepest-first.
     for path in violations.iter().rev() {
@@ -1117,6 +1598,17 @@ fn restore_violations(
         match (prev, curr) {
             (None, Some(SnapshotEntry::File { .. } | SnapshotEntry::Symlink(_))) => {
                 if let Err(err) = remove_file_or_symlink(&full) {
+                    errors.push(format!("{path}: {err}"));
+                }
+            }
+            (None, Some(SnapshotEntry::Unreadable)) => {
+                let err = match fs::symlink_metadata(&full) {
+                    Ok(meta) if meta.file_type().is_dir() => remove_dir_if_present(&full),
+                    Ok(_) => remove_file_or_symlink(&full),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                };
+                if let Err(err) = err {
                     errors.push(format!("{path}: {err}"));
                 }
             }
@@ -1141,17 +1633,17 @@ fn restore_violations(
         }
     }
 
-    // 2. Recreate deleted/replaced directories shallowest-first and restore dir permissions.
+    // 2. Recreate deleted/replaced directories shallowest-first with accessible permissions first.
     for path in violations {
-        if let Some(SnapshotEntry::Dir { mode }) = before.entries.get(path) {
+        if let Some(SnapshotEntry::Dir { .. }) = before.entries.get(path) {
             let full = root.join(path);
-            if let Err(err) = fs::create_dir_all(&full).and_then(|()| restore_mode(&full, *mode)) {
+            if let Err(err) = fs::create_dir_all(&full).and_then(|()| make_dir_accessible(&full)) {
                 errors.push(format!("{path}: {err}"));
             }
         }
     }
 
-    // 3. Restore modified/deleted files and symlinks.
+    // 3. Restore modified/deleted/unreadable files and symlinks.
     for path in violations {
         let full = root.join(path);
         match before.entries.get(path) {
@@ -1195,11 +1687,53 @@ fn restore_violations(
                     errors.push(format!("{path}: cannot restore symlink on non-Unix host"));
                 }
             }
-            Some(SnapshotEntry::LockedFile { .. } | SnapshotEntry::Dir { .. }) | None => {}
+            Some(
+                SnapshotEntry::LockedFile { .. }
+                | SnapshotEntry::Dir { .. }
+                | SnapshotEntry::Unreadable,
+            )
+            | None => {}
+        }
+    }
+
+    // 4. Restore original directory modes deepest-first once children have been restored.
+    for path in violations.iter().rev() {
+        if let Some(SnapshotEntry::Dir { mode }) = before.entries.get(path) {
+            let full = root.join(path);
+            if let Err(err) = restore_mode(&full, *mode) {
+                errors.push(format!("{path}: {err}"));
+            }
         }
     }
 
     errors
+}
+
+fn make_dir_accessible(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = meta.permissions();
+                perms.set_mode(perms.mode() | 0o700);
+                fs::set_permissions(path, perms)
+            }
+            #[cfg(not(unix))]
+            {
+                let mut perms = meta.permissions();
+                if perms.readonly() {
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    perms.set_readonly(false);
+                    fs::set_permissions(path, perms)?;
+                }
+                Ok(())
+            }
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn make_writable_if_exists(path: &Path) -> io::Result<()> {
@@ -1400,6 +1934,7 @@ impl TempArtifactsDir {
 
 impl Drop for TempArtifactsDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = make_dir_accessible(&self.0);
+        let _ = remove_dir_if_present(&self.0);
     }
 }
