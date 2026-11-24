@@ -13,7 +13,8 @@ use storyflow::{
     adapters::{
         ADAPTER_SCHEMA, AdapterOutcome, AdapterRequest, CancelToken, CodexAdapter,
         CodexAdapterConfig, ExecutionPolicy, FakeAdapter, FakeBehavior, HostAdapter,
-        ReconcileReport, ReconcileStatus, SessionCorrelation, codex::CodexCommandRunner,
+        ReconcileReport, ReconcileStatus, SessionCorrelation,
+        codex::{CodexCommandRunner, ProcessCommandRunner},
         dispatch_and_run, reconcile_outcome,
     },
     security::process::{ControlledResult, HostCommandSpec, ProcessError, ProcessResult},
@@ -1186,6 +1187,74 @@ fn codex_adapter_enforces_workspace_isolation_and_write_scope() {
     let empty_report =
         reconcile_outcome(&mut journal, &empty_scope_dispatch, empty_outcome, &clock).unwrap();
     assert_eq!(empty_report.status, ReconcileStatus::HostUnavailable);
+}
+
+#[test]
+fn codex_adapter_protects_root_git_metadata_and_resolves_relative_executable() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-git");
+    fs::create_dir_all(workdir.join(".git")).unwrap();
+    fs::write(workdir.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let sandbox_help = "Usage: codex exec --sandbox <MODE> --json [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": 1,
+        "status": "succeeded",
+        "report": "attempted .git/config edit",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation(".git/config", "[core]\n\tfsmonitor = malicious\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.status, ReconcileStatus::Blocked);
+    assert_eq!(report.code, "invalid_output");
+    assert!(report.detail.contains(".git/config"));
+
+    // Relative configured executable path must be canonicalized to an absolute path.
+    let bin_path = fixture.root.join("codex-mock-bin");
+    fs::write(&bin_path, "placeholder").unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    if let Ok(rel_path) = bin_path.strip_prefix(&cwd) {
+        let resolved = ProcessCommandRunner
+            .resolve_executable(Some(rel_path))
+            .expect("relative executable should resolve");
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, fs::canonicalize(&bin_path).unwrap());
+    }
 }
 
 #[test]

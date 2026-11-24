@@ -14,14 +14,16 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs, io,
+    collections::{BTreeMap, BTreeSet, hash_map::RandomState},
+    fs::{self, DirBuilder, OpenOptions},
+    hash::{BuildHasher, Hasher},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -66,23 +68,27 @@ impl CodexCommandRunner for ProcessCommandRunner {
     fn resolve_executable(&self, configured: Option<&Path>) -> Result<PathBuf, String> {
         let path = match configured {
             Some(path) => {
+                if is_windows_batch(path) {
+                    return Err("implicit batch wrapper refused for codex executable".to_owned());
+                }
                 if !path.is_file() {
                     return Err(format!(
                         "configured codex executable not found: {}",
                         path.display()
                     ));
                 }
-                path.to_path_buf()
+                fs::canonicalize(path).map_err(|e| {
+                    format!(
+                        "failed to resolve configured codex executable {}: {e}",
+                        path.display()
+                    )
+                })?
             }
             None => {
                 host_executable("codex").map_err(|e| format!("codex not found on PATH: {e}"))?
             }
         };
-        if cfg!(windows)
-            && path.extension().is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd")
-            })
-        {
+        if is_windows_batch(&path) {
             return Err("implicit batch wrapper refused for codex executable".to_owned());
         }
         Ok(path)
@@ -367,7 +373,7 @@ impl HostAdapter for CodexAdapter {
         let schema_path = temp_dir.path().join("result-schema.json");
         let output_path = temp_dir.path().join("last-message.json");
         if caps.supports_output_schema
-            && let Err(err) = fs::write(&schema_path, output_schema_json())
+            && let Err(err) = write_exclusive_file(&schema_path, output_schema_json().as_bytes())
         {
             return AdapterOutcome::HostCrashed {
                 correlation: fallback_correlation,
@@ -480,15 +486,15 @@ impl HostAdapter for CodexAdapter {
             };
         }
 
-        let payload = if caps.supports_output_file && output_path.is_file() {
-            match fs::read_to_string(&output_path) {
-                Ok(text) if !text.trim().is_empty() => Some(text),
-                Ok(_) => extract_message_from_stdout(&stdout_text, caps.supports_json_output),
-                Err(err) => {
+        let payload = if caps.supports_output_file {
+            match read_last_message_file(&output_path) {
+                Ok(Some(text)) => Some(text),
+                Ok(None) => extract_message_from_stdout(&stdout_text, caps.supports_json_output),
+                Err(detail) => {
                     return AdapterOutcome::InvalidOutput {
                         correlation,
                         worker_stopped: true,
-                        detail: format!("failed to read codex last message file: {err}"),
+                        detail,
                     };
                 }
             }
@@ -828,7 +834,7 @@ fn collect_snapshot(
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        if rel_str.is_empty() || fold_path(&rel_str) == ".git" {
+        if rel_str.is_empty() {
             continue;
         }
         let meta = fs::symlink_metadata(&path)?;
@@ -940,17 +946,98 @@ fn is_protected_path(path: &str) -> bool {
             .any(|protected| within_path(&folded, &fold_path(protected)))
 }
 
+fn is_windows_batch(path: &Path) -> bool {
+    cfg!(windows)
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
+}
+
+fn write_exclusive_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.flush()
+}
+
+fn read_last_message_file(path: &Path) -> Result<Option<String>, String> {
+    const MAX_LAST_MESSAGE_BYTES: u64 = 65_536;
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to inspect codex last message file: {err}")),
+    };
+    if !meta.file_type().is_file() {
+        return Err("codex last message path is not a regular file".to_owned());
+    }
+    if meta.len() > MAX_LAST_MESSAGE_BYTES {
+        return Err("codex last message file exceeds size limit".to_owned());
+    }
+    let file = fs::File::open(path)
+        .map_err(|err| format!("failed to open codex last message file: {err}"))?;
+    let mut buf = Vec::new();
+    file.take(MAX_LAST_MESSAGE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|err| format!("failed to read codex last message file: {err}"))?;
+    if buf.len() as u64 > MAX_LAST_MESSAGE_BYTES {
+        return Err("codex last message file exceeds size limit".to_owned());
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|err| format!("codex last message file is not valid UTF-8: {err}"))?;
+    if text.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(text))
+    }
+}
+
 struct TempArtifactsDir(PathBuf);
 
 impl TempArtifactsDir {
     fn new() -> io::Result<Self> {
-        let dir = std::env::temp_dir().join(format!(
-            "storyflow-codex-{}-{}",
-            std::process::id(),
-            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir)?;
-        Ok(Self(dir))
+        let base = std::env::temp_dir();
+        for _ in 0..16 {
+            let mut hasher = Sha256::new();
+            hasher.update(std::process::id().to_le_bytes());
+            hasher.update(TEMP_COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            hasher.update(nanos.to_le_bytes());
+            let mut rng_hasher = RandomState::new().build_hasher();
+            rng_hasher.write_u64(nanos as u64);
+            hasher.update(rng_hasher.finish().to_le_bytes());
+            let digest = hasher.finalize();
+            let mut suffix = String::with_capacity(32);
+            for byte in &digest[..16] {
+                use std::fmt::Write as _;
+                let _ = write!(&mut suffix, "{byte:02x}");
+            }
+            let dir = base.join(format!("storyflow-codex-{suffix}"));
+            let mut builder = DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "failed to allocate unique codex artifact directory",
+        ))
     }
 
     fn path(&self) -> &Path {
