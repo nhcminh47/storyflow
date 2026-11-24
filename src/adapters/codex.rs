@@ -44,6 +44,13 @@ const FORBIDDEN_FLAGS: &[&str] = &[
     "danger-full-access",
     "--cd",
     "-C",
+    "--add-dir",
+    "--config",
+    "-c",
+    "--profile",
+    "-p",
+    "--enable",
+    "--disable",
     "--json",
     "--output-schema",
     "--output-last-message",
@@ -51,6 +58,8 @@ const FORBIDDEN_FLAGS: &[&str] = &[
     "--auto-merge",
     "--push",
 ];
+
+const FORBIDDEN_SHORT_PREFIXES: &[&str] = &["-a", "-s", "-c", "-C", "-o", "-p"];
 
 pub trait CodexCommandRunner: Send + Sync {
     fn resolve_executable(&self, configured: Option<&Path>) -> Result<PathBuf, String>;
@@ -111,6 +120,7 @@ pub struct CodexAdapterConfig {
     pub probe_timeout: Duration,
     pub passthrough_env: Vec<String>,
     pub extra_args: Vec<String>,
+    pub max_backup_bytes: usize,
 }
 
 impl Default for CodexAdapterConfig {
@@ -132,6 +142,7 @@ impl Default for CodexAdapterConfig {
             .map(str::to_owned)
             .collect(),
             extra_args: Vec::new(),
+            max_backup_bytes: MAX_BACKUP_BYTES,
         }
     }
 }
@@ -160,9 +171,15 @@ impl CodexAdapterConfig {
                 ));
             }
             let flag_name = arg.split('=').next().unwrap_or(arg.as_str());
+            let lower = arg.to_ascii_lowercase();
+            let short_prefix_hit = !arg.starts_with("--")
+                && FORBIDDEN_SHORT_PREFIXES.iter().any(|p| arg.starts_with(p));
             if FORBIDDEN_FLAGS
                 .iter()
                 .any(|f| flag_name.eq_ignore_ascii_case(f) || arg.eq_ignore_ascii_case(f))
+                || short_prefix_hit
+                || lower.contains("writable_roots")
+                || lower.contains("sandbox_mode")
             {
                 return Err(AdapterError::new(
                     "forbidden_host_flag",
@@ -335,19 +352,29 @@ impl HostAdapter for CodexAdapter {
             };
         }
 
-        let before_snapshot = match snapshot_workspace(&request.workdir, true) {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                return AdapterOutcome::HostCrashed {
-                    correlation: fallback_correlation,
-                    worker_stopped: true,
-                    exit_code: None,
-                    detail: sanitize_reason(&format!(
-                        "failed to snapshot codex workspace before execution: {err}"
-                    )),
-                };
-            }
-        };
+        let before_snapshot =
+            match snapshot_workspace(&request.workdir, true, self.config.max_backup_bytes) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    return AdapterOutcome::HostCrashed {
+                        correlation: fallback_correlation,
+                        worker_stopped: true,
+                        exit_code: None,
+                        detail: sanitize_reason(&format!(
+                            "failed to snapshot codex workspace before execution: {err}"
+                        )),
+                    };
+                }
+            };
+        if request.policy == ExecutionPolicy::WorkspaceWrite && before_snapshot.incomplete_backup {
+            return AdapterOutcome::HostUnavailable {
+                provider: "codex".to_owned(),
+                detail: format!(
+                    "workspace exceeds {} byte rollback backup limit for WorkspaceWrite; use a clean isolated worktree",
+                    self.config.max_backup_bytes
+                ),
+            };
+        }
 
         let prompt = match build_prompt(request) {
             Ok(prompt) => prompt,
@@ -872,15 +899,21 @@ struct WorkspaceSnapshot {
     entries: BTreeMap<String, SnapshotEntry>,
     backups: BTreeMap<String, Vec<u8>>,
     backup_bytes: usize,
+    incomplete_backup: bool,
 }
 
-fn snapshot_workspace(root: &Path, capture_backups: bool) -> io::Result<WorkspaceSnapshot> {
+fn snapshot_workspace(
+    root: &Path,
+    capture_backups: bool,
+    max_backup_bytes: usize,
+) -> io::Result<WorkspaceSnapshot> {
     let mut snapshot = WorkspaceSnapshot {
         entries: BTreeMap::new(),
         backups: BTreeMap::new(),
         backup_bytes: 0,
+        incomplete_backup: false,
     };
-    collect_snapshot(root, root, capture_backups, &mut snapshot)?;
+    collect_snapshot(root, root, capture_backups, max_backup_bytes, &mut snapshot)?;
     Ok(snapshot)
 }
 
@@ -888,6 +921,7 @@ fn collect_snapshot(
     root: &Path,
     dir: &Path,
     capture_backups: bool,
+    max_backup_bytes: usize,
     snapshot: &mut WorkspaceSnapshot,
 ) -> io::Result<()> {
     let mut children: Vec<_> = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
@@ -920,7 +954,7 @@ fn collect_snapshot(
                     mode: entry_mode(&meta),
                 },
             );
-            collect_snapshot(root, &path, capture_backups, snapshot)?;
+            collect_snapshot(root, &path, capture_backups, max_backup_bytes, snapshot)?;
         } else if file_type.is_file() {
             let mode = entry_mode(&meta);
             let mut file = fs::File::open(&path)?;
@@ -929,7 +963,10 @@ fn collect_snapshot(
                 && usize::try_from(meta.len())
                     .ok()
                     .and_then(|len| snapshot.backup_bytes.checked_add(len))
-                    .is_some_and(|total| total <= MAX_BACKUP_BYTES);
+                    .is_some_and(|total| total <= max_backup_bytes);
+            if capture_backups && !store_backup {
+                snapshot.incomplete_backup = true;
+            }
             if store_backup {
                 let mut bytes = Vec::with_capacity(meta.len() as usize);
                 match file.read_to_end(&mut bytes) {
@@ -1011,7 +1048,7 @@ fn verify_and_restore_post_run(
     policy: ExecutionPolicy,
     write_scope: &[String],
 ) -> Result<(), String> {
-    let after = snapshot_workspace(root, false)
+    let after = snapshot_workspace(root, false, 0)
         .map_err(|err| format!("failed to verify codex workspace changes: {err}"))?;
     let all_paths: BTreeSet<&String> = before.entries.keys().chain(after.entries.keys()).collect();
     let mut violations = Vec::new();

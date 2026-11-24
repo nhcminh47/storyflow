@@ -778,7 +778,17 @@ Options:
         "--full-auto",
         "--ask-for-approval=never",
         "-a",
+        "-anever",
         "--sandbox=danger-full-access",
+        "--add-dir",
+        "--add-dir=/tmp",
+        "--config",
+        "-c",
+        "-csandbox_mode=danger-full-access",
+        "--profile",
+        "-p",
+        "--enable",
+        "--disable",
         "--auto-merge",
         "--push",
     ] {
@@ -1034,7 +1044,7 @@ fn codex_adapter_enforces_workspace_isolation_and_write_scope() {
     let fixture = Fixture::new();
     let workdir = fixture.isolated_workdir("wt-scope");
     let clock = FakeClock::at(100);
-    let mut journal = fixture.configured(policy(1, 5), &clock);
+    let mut journal = fixture.configured(policy(1, 10), &clock);
 
     let sandbox_help = "Usage: codex exec --sandbox <MODE> --json [PROMPT]\n";
     let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
@@ -1243,6 +1253,58 @@ fn codex_adapter_enforces_workspace_isolation_and_write_scope() {
     let empty_report =
         reconcile_outcome(&mut journal, &empty_scope_dispatch, empty_outcome, &clock).unwrap();
     assert_eq!(empty_report.status, ReconcileStatus::HostUnavailable);
+
+    // 5. Refuse WorkspaceWrite when rollback backup coverage is incomplete.
+    journal
+        .retry_task(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "retry backup budget check",
+            &clock,
+        )
+        .unwrap();
+    let bounded_workdir = fixture.isolated_workdir("wt-backup-cap");
+    fs::write(
+        bounded_workdir.join("app/existing.txt"),
+        "0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+    let bounded_runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    bounded_runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    bounded_runner.push_ok(0, sandbox_help, "", false, false);
+    let bounded_adapter = CodexAdapter::with_runner(
+        CodexAdapterConfig {
+            max_backup_bytes: 16,
+            ..Default::default()
+        },
+        bounded_runner.clone(),
+    );
+    let cap_dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+    let cap_req = AdapterRequest {
+        schema: ADAPTER_SCHEMA,
+        dispatch: cap_dispatch.clone(),
+        workdir: bounded_workdir,
+        timeout_ms: 10_000,
+        policy: ExecutionPolicy::WorkspaceWrite,
+    };
+    let cap_outcome = bounded_adapter.execute(&cap_req, &cancel);
+    assert!(matches!(
+        cap_outcome,
+        AdapterOutcome::HostUnavailable { ref detail, .. } if detail.contains("rollback backup limit")
+    ));
+    let cap_report = reconcile_outcome(&mut journal, &cap_dispatch, cap_outcome, &clock).unwrap();
+    assert_eq!(cap_report.status, ReconcileStatus::HostUnavailable);
+    // Probe ran (2 calls), exec was never invoked.
+    assert_eq!(bounded_runner.calls().len(), 2);
 }
 
 #[test]
