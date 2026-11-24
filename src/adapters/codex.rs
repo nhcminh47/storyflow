@@ -5,14 +5,16 @@ use super::{
     sanitize_reason,
 };
 use crate::{
+    config::BUILTIN_PROTECTED,
     security::process::{
         ControlledResult, HostCommandSpec, ProcessError, host_executable, run_host_command,
     },
     tasks::{Artifact, ResultStatus, SCHEMA, WorkerResult},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -21,6 +23,7 @@ use std::{
     },
     time::Duration,
 };
+use unicode_normalization::UnicodeNormalization;
 
 const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 5;
 const MAX_PROMPT_BYTES: usize = 32_768;
@@ -296,12 +299,24 @@ impl HostAdapter for CodexAdapter {
         }
 
         let caps = self.probe();
-        if !caps.available {
+        if !caps.available || !caps.supports_sandbox_flag {
             return AdapterOutcome::HostUnavailable {
                 provider: "codex".to_owned(),
-                detail: caps
-                    .unavailable_reason
-                    .unwrap_or_else(|| "codex host is unavailable".to_owned()),
+                detail: caps.unavailable_reason.unwrap_or_else(|| {
+                    "codex host cannot enforce required '--sandbox' policy".to_owned()
+                }),
+            };
+        }
+
+        if request.policy == ExecutionPolicy::WorkspaceWrite
+            && let Err(detail) = ensure_isolated_workspace(
+                &request.workdir,
+                &request.dispatch.packet.task.spec.write_scope,
+            )
+        {
+            return AdapterOutcome::HostUnavailable {
+                provider: "codex".to_owned(),
+                detail,
             };
         }
 
@@ -312,6 +327,20 @@ impl HostAdapter for CodexAdapter {
                 reason: "cancelled before launching codex".to_owned(),
             };
         }
+
+        let before_snapshot = match snapshot_workspace(&request.workdir) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return AdapterOutcome::HostCrashed {
+                    correlation: fallback_correlation,
+                    worker_stopped: true,
+                    exit_code: None,
+                    detail: sanitize_reason(&format!(
+                        "failed to snapshot codex workspace before execution: {err}"
+                    )),
+                };
+            }
+        };
 
         let exe = match caps.executable.as_deref() {
             Some(path) => path.to_owned(),
@@ -354,13 +383,11 @@ impl HostAdapter for CodexAdapter {
             args.push("--cd".to_owned());
             args.push(request.workdir.to_string_lossy().into_owned());
         }
-        if caps.supports_sandbox_flag {
-            args.push("--sandbox".to_owned());
-            args.push(match request.policy {
-                ExecutionPolicy::ReadOnly => "read-only".to_owned(),
-                ExecutionPolicy::WorkspaceWrite => "workspace-write".to_owned(),
-            });
-        }
+        args.push("--sandbox".to_owned());
+        args.push(match request.policy {
+            ExecutionPolicy::ReadOnly => "read-only".to_owned(),
+            ExecutionPolicy::WorkspaceWrite => "workspace-write".to_owned(),
+        });
         if caps.supports_json_output {
             args.push("--json".to_owned());
         }
@@ -488,6 +515,31 @@ impl HostAdapter for CodexAdapter {
             }
         };
 
+        let after_snapshot = match snapshot_workspace(&request.workdir) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return AdapterOutcome::InvalidOutput {
+                    correlation,
+                    worker_stopped: true,
+                    detail: sanitize_reason(&format!(
+                        "failed to verify codex workspace changes: {err}"
+                    )),
+                };
+            }
+        };
+        if let Err(detail) = verify_workspace_changes(
+            &before_snapshot,
+            &after_snapshot,
+            request.policy,
+            &request.dispatch.packet.task.spec.write_scope,
+        ) {
+            return AdapterOutcome::InvalidOutput {
+                correlation,
+                worker_stopped: true,
+                detail: sanitize_reason(&detail),
+            };
+        }
+
         AdapterOutcome::Completed {
             correlation,
             result: WorkerResult {
@@ -541,7 +593,7 @@ fn parse_exec_help(exe: &str, version: Option<String>, help_text: &str) -> HostC
     HostCapabilities {
         schema: ADAPTER_SCHEMA,
         provider: "codex".to_owned(),
-        available: true,
+        available: supports_sandbox_flag,
         version,
         executable: Some(exe.to_owned()),
         supports_json_output,
@@ -553,7 +605,14 @@ fn parse_exec_help(exe: &str, version: Option<String>, help_text: &str) -> HostC
         supports_session_id: supports_json_output,
         supports_stdin_prompt,
         detected_flags: detected.into_iter().collect(),
-        unavailable_reason: None,
+        unavailable_reason: if supports_sandbox_flag {
+            None
+        } else {
+            Some(
+                "installed codex host does not advertise '--sandbox' required to enforce execution policy"
+                    .to_owned(),
+            )
+        },
     }
 }
 
@@ -712,6 +771,173 @@ fn output_schema_json() -> &'static str {
     }
   }
 }"#
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotEntry {
+    Dir,
+    File { len: u64, sha256: [u8; 32] },
+    LockedFile(u64),
+    Symlink(String),
+}
+
+fn ensure_isolated_workspace(workdir: &Path, write_scope: &[String]) -> Result<(), String> {
+    match fs::symlink_metadata(workdir.join(".storyflow")) {
+        Ok(_) => {
+            return Err(
+                "workspace_write refused in directory containing .storyflow/; run Codex in an isolated worktree"
+                    .to_owned(),
+            );
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "workspace_write refused: failed to inspect .storyflow isolation boundary: {err}"
+            ));
+        }
+    }
+    if write_scope.is_empty() {
+        return Err(
+            "workspace_write refused for task with empty write_scope; use ReadOnly policy"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn snapshot_workspace(root: &Path) -> io::Result<BTreeMap<String, SnapshotEntry>> {
+    let mut entries = BTreeMap::new();
+    collect_snapshot(root, root, &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_snapshot(
+    root: &Path,
+    dir: &Path,
+    entries: &mut BTreeMap<String, SnapshotEntry>,
+) -> io::Result<()> {
+    let mut children: Vec<_> = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let path = child.path();
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| io::Error::other("workspace path escaped root"))?;
+        let rel_str = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if rel_str.is_empty() || fold_path(&rel_str) == ".git" {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&path)?;
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            let target = fs::read_link(&path)?;
+            entries.insert(
+                rel_str,
+                SnapshotEntry::Symlink(target.to_string_lossy().into_owned()),
+            );
+        } else if file_type.is_dir() {
+            entries.insert(rel_str, SnapshotEntry::Dir);
+            collect_snapshot(root, &path, entries)?;
+        } else if file_type.is_file() {
+            let mut file = fs::File::open(&path)?;
+            let mut hasher = Sha256::new();
+            match io::copy(&mut file, &mut hasher) {
+                Ok(_) => {
+                    let sha256: [u8; 32] = hasher.finalize().into();
+                    entries.insert(
+                        rel_str,
+                        SnapshotEntry::File {
+                            len: meta.len(),
+                            sha256,
+                        },
+                    );
+                }
+                Err(err)
+                    if cfg!(windows)
+                        && err.raw_os_error() == Some(33)
+                        && rel_str.starts_with(".storyflow/")
+                        && (rel_str.ends_with("/tasks.lock") || rel_str.ends_with("/run.lock")) =>
+                {
+                    entries.insert(rel_str, SnapshotEntry::LockedFile(meta.len()));
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported special file in workspace: {rel_str}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_workspace_changes(
+    before: &BTreeMap<String, SnapshotEntry>,
+    after: &BTreeMap<String, SnapshotEntry>,
+    policy: ExecutionPolicy,
+    write_scope: &[String],
+) -> Result<(), String> {
+    let all_paths: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    let mut violations = Vec::new();
+    for path in all_paths {
+        let prev = before.get(path);
+        let curr = after.get(path);
+        if prev == curr {
+            continue;
+        }
+        if policy == ExecutionPolicy::ReadOnly || is_protected_path(path) {
+            violations.push(path.clone());
+            continue;
+        }
+        let folded_path = fold_path(path);
+        let in_write_scope = write_scope
+            .iter()
+            .any(|scope| within_path(&folded_path, &fold_path(scope)));
+        let created_parent_for_scope = prev.is_none()
+            && matches!(curr, Some(SnapshotEntry::Dir))
+            && write_scope
+                .iter()
+                .any(|scope| within_path(&fold_path(scope), &folded_path));
+        if !in_write_scope && !created_parent_for_scope {
+            violations.push(path.clone());
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        let sample = violations
+            .into_iter()
+            .take(16)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "codex modified paths outside allowed scope ({policy:?}): {sample}"
+        ))
+    }
+}
+
+fn fold_path(value: &str) -> String {
+    value.nfc().flat_map(char::to_lowercase).collect()
+}
+
+fn within_path(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn is_protected_path(path: &str) -> bool {
+    let folded = fold_path(path);
+    path.split('/').any(|seg| fold_path(seg) == ".git")
+        || BUILTIN_PROTECTED
+            .iter()
+            .any(|protected| within_path(&folded, &fold_path(protected)))
 }
 
 struct TempArtifactsDir(PathBuf);

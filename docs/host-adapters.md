@@ -31,9 +31,9 @@ Core types live in `src/adapters/mod.rs`:
 | --- | --- | --- | --- | --- |
 | `probe().available == false` (before dispatch) | No lease reserved (attempt budget preserved) | `HostUnavailable` | `true` | `true` |
 | Valid `Completed` on active lease (`worker_stopped: true`) | `complete_attempt` | `Applied` | `true` | `false` (succeeded) / `true` (failed/blocked) |
-| Duplicate, unknown attempt, or mismatched lease | None (rejected) | `RejectedDuplicateOrStale` | `false` | `false` |
+| Duplicate, unknown attempt, or mismatched lease/correlation | None (rejected; active lease stays occupied) | `RejectedDuplicateOrStale` | `false` | `false` |
 | Attempt already settled (`worker_stopped: true`) | None (rejected) | `RejectedDuplicateOrStale` | `false` | `false` |
-| Correlation mismatch or invalid `WorkerResult` (`worker_stopped: true`) | `confirm_stopped` (task becomes `Blocked`) | `Blocked` | `true` | `true` |
+| Invalid `session_id` (matched lease) or invalid `WorkerResult` (`worker_stopped: true`) | `confirm_stopped` (task becomes `Blocked`) | `Blocked` | `true` | `true` |
 | `Completed` / failure with `worker_stopped: false` | None (capacity stays occupied) | `BlockedUnstopped` | `false` | `false` |
 | Lease expired (`now >= expires_at_ms`, `worker_stopped: true`) | `recover_expired` + `confirm_stopped` | `Blocked` (`lease_expired`) | `true` | `true` |
 | `TimedOut` / `HostCrashed` / `InvalidOutput` (`worker_stopped: true`) | `confirm_stopped` (task becomes `Blocked`) | `Blocked` | `true` | `true` |
@@ -53,7 +53,8 @@ Core types live in `src/adapters/mod.rs`:
 
 `src/adapters/codex.rs` implements `CodexAdapter` on top of `security::process::run_host_command`:
 
-- **Capability probing:** Resolves `executable` (explicit path or `host_executable("codex")` on absolute `PATH`, refusing `.bat`/`.cmd` wrappers on Windows), runs `codex --version` and `codex exec --help` under `probe_timeout`, and only emits flags actually observed in help output (`--cd`, `--sandbox`, `--json`, `--output-schema`, `--output-last-message`, `--ephemeral`, and `-` stdin prompt).
+- **Capability probing:** Resolves `executable` (explicit path or `host_executable("codex")` on absolute `PATH`, refusing `.bat`/`.cmd` wrappers on Windows), runs `codex --version` and `codex exec --help` under `probe_timeout`, and only emits flags actually observed in help output (`--cd`, `--sandbox`, `--json`, `--output-schema`, `--output-last-message`, `--ephemeral`, and `-` stdin prompt). If `--sandbox` is not advertised, `probe()` and `execute()` fail closed as unavailable (`HostUnavailable`) rather than falling back to ambient Codex defaults.
+- **Workspace isolation & write-scope enforcement:** `ExecutionPolicy::WorkspaceWrite` refuses directories containing `.storyflow/` or tasks with empty `write_scope` (run writable tasks in an isolated worktree). Before and after `codex exec`, `CodexAdapter` snapshots `workdir` and rejects any modification outside `write_scope`, any change under `ExecutionPolicy::ReadOnly`, or any change to `.git` / `BUILTIN_PROTECTED` paths (`InvalidOutput`).
 - **Safe flag policy:** `CodexAdapterConfig::validate()` rejects empty/control-char args and refuses high-risk or reserved flags in `extra_args` (`--yolo`, `--dangerously-bypass-approvals-and-sandbox`, `--full-auto`, `--ask-for-approval`, `-a`, `--sandbox`, `-s`, `danger-full-access`, `--cd`, `-C`, `--json`, `--output-schema`, `--output-last-message`, `-o`, `--auto-merge`, `--push`).
 - **Environment filtering:** Starts from `security::process::configure_environment` and passes through only explicit variable names in `CodexAdapterConfig::passthrough_env` (`HOME`, `USERPROFILE`, `CODEX_HOME`, `XDG_CONFIG_HOME`, `APPDATA`, `LOCALAPPDATA`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`), never logging or serializing secret values.
 - **Process-tree containment & cancellation:** Cancellation triggers `ChildGuard::cleanup()` (Windows Job Object / Linux process group `SIGKILL`) before returning `worker_stopped: true`. If supervision cleanup fails, `worker_stopped` is reported as `false`.

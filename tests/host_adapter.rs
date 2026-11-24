@@ -11,9 +11,10 @@ use std::{
 };
 use storyflow::{
     adapters::{
-        ADAPTER_SCHEMA, AdapterRequest, CancelToken, CodexAdapter, CodexAdapterConfig,
-        ExecutionPolicy, FakeAdapter, FakeBehavior, HostAdapter, ReconcileReport, ReconcileStatus,
-        codex::CodexCommandRunner, dispatch_and_run, reconcile_outcome,
+        ADAPTER_SCHEMA, AdapterOutcome, AdapterRequest, CancelToken, CodexAdapter,
+        CodexAdapterConfig, ExecutionPolicy, FakeAdapter, FakeBehavior, HostAdapter,
+        ReconcileReport, ReconcileStatus, SessionCorrelation, codex::CodexCommandRunner,
+        dispatch_and_run, reconcile_outcome,
     },
     security::process::{ControlledResult, HostCommandSpec, ProcessError, ProcessResult},
     tasks::*,
@@ -78,6 +79,12 @@ impl Fixture {
 
     fn story_events_dir(&self) -> PathBuf {
         self.root.join(format!(".storyflow/{STORY}/events"))
+    }
+
+    fn isolated_workdir(&self, name: &str) -> PathBuf {
+        let dir = self.root.join("worktrees").join(name);
+        fs::create_dir_all(dir.join("app")).unwrap();
+        dir
     }
 }
 impl Drop for Fixture {
@@ -168,6 +175,7 @@ struct MockCodexRunner {
     responses: Mutex<Vec<Result<ControlledResult, ProcessError>>>,
     calls: Mutex<Vec<HostCommandSpec>>,
     write_last_message: Mutex<Option<String>>,
+    workspace_mutation: Mutex<Option<(PathBuf, String)>>,
 }
 
 impl MockCodexRunner {
@@ -177,6 +185,7 @@ impl MockCodexRunner {
             responses: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             write_last_message: Mutex::new(None),
+            workspace_mutation: Mutex::new(None),
         }
     }
 
@@ -204,6 +213,11 @@ impl MockCodexRunner {
 
     fn set_last_message(&self, content: &str) {
         *self.write_last_message.lock().unwrap() = Some(content.to_owned());
+    }
+
+    fn set_workspace_mutation(&self, rel_path: &str, content: &str) {
+        *self.workspace_mutation.lock().unwrap() =
+            Some((PathBuf::from(rel_path), content.to_owned()));
     }
 
     fn calls(&self) -> Vec<HostCommandSpec> {
@@ -242,11 +256,20 @@ impl CodexCommandRunner for MockCodexRunner {
         });
         if spec.args.first().map(String::as_str) == Some("exec")
             && spec.args.get(1).map(String::as_str) != Some("--help")
-            && let Some(msg) = self.write_last_message.lock().unwrap().clone()
-            && let Some(pos) = spec.args.iter().position(|a| a == "--output-last-message")
-            && let Some(path) = spec.args.get(pos + 1)
         {
-            fs::write(path, msg).unwrap();
+            if let Some((rel, content)) = self.workspace_mutation.lock().unwrap().clone() {
+                let target = _cwd.join(rel);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(target, content).unwrap();
+            }
+            if let Some(msg) = self.write_last_message.lock().unwrap().clone()
+                && let Some(pos) = spec.args.iter().position(|a| a == "--output-last-message")
+                && let Some(path) = spec.args.get(pos + 1)
+            {
+                fs::write(path, msg).unwrap();
+            }
         }
         let mut queue = self.responses.lock().unwrap();
         assert!(!queue.is_empty(), "unexpected runner call: {:?}", spec.args);
@@ -404,11 +427,6 @@ fn invalid_mismatched_stale_duplicate_and_crash_outcomes_are_safely_reconciled()
             "invalid_output",
         ),
         (
-            "mismatched correlation",
-            FakeBehavior::MismatchedCorrelation,
-            "correlation_mismatch",
-        ),
-        (
             "invalid session id",
             FakeBehavior::InvalidSessionId {
                 session_id: "bad\nsession".into(),
@@ -513,6 +531,91 @@ fn invalid_mismatched_stale_duplicate_and_crash_outcomes_are_safely_reconciled()
     assert_eq!(duplicate.status, ReconcileStatus::RejectedDuplicateOrStale);
     assert_eq!(duplicate.code, "duplicate_or_settled_attempt");
     assert_eq!(journal.view().revision.unwrap(), rev_after_first);
+}
+
+#[test]
+fn misrouted_outcomes_cannot_free_active_leases() {
+    let fixture = Fixture::new();
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 3), &clock);
+    let dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "host-1",
+            &clock,
+        )
+        .unwrap();
+    let rev_before = journal.view().revision.unwrap();
+
+    let wrong_corr = SessionCorrelation {
+        attempt_id: "other-attempt".to_owned(),
+        lease_id: dispatch.lease.lease_id.clone(),
+        owner: dispatch.lease.owner.clone(),
+        session_id: "sess-1".to_owned(),
+    };
+    let wrong_lease = SessionCorrelation {
+        attempt_id: dispatch.lease.attempt_id.clone(),
+        lease_id: "other-lease".to_owned(),
+        owner: dispatch.lease.owner.clone(),
+        session_id: "sess-2".to_owned(),
+    };
+    let wrong_owner = SessionCorrelation {
+        attempt_id: dispatch.lease.attempt_id.clone(),
+        lease_id: dispatch.lease.lease_id.clone(),
+        owner: "other-host".to_owned(),
+        session_id: "sess-3".to_owned(),
+    };
+
+    let misrouted_outcomes = [
+        AdapterOutcome::Completed {
+            correlation: wrong_lease.clone(),
+            result: WorkerResult {
+                schema: SCHEMA,
+                story: STORY.to_owned(),
+                task: "a".to_owned(),
+                task_revision: dispatch.packet.task.revision,
+                status: ResultStatus::Succeeded,
+                report: "forged".to_owned(),
+                commit: None,
+                artifacts: Vec::new(),
+            },
+            worker_stopped: true,
+        },
+        AdapterOutcome::Cancelled {
+            correlation: wrong_corr,
+            worker_stopped: true,
+            reason: "stale cancel".to_owned(),
+        },
+        AdapterOutcome::TimedOut {
+            correlation: wrong_lease,
+            worker_stopped: true,
+            reason: "stale timeout".to_owned(),
+        },
+        AdapterOutcome::HostCrashed {
+            correlation: wrong_owner.clone(),
+            worker_stopped: true,
+            exit_code: Some(1),
+            detail: "stale crash".to_owned(),
+        },
+        AdapterOutcome::InvalidOutput {
+            correlation: wrong_owner,
+            worker_stopped: true,
+            detail: "stale invalid output".to_owned(),
+        },
+    ];
+
+    for outcome in misrouted_outcomes {
+        let report = reconcile_outcome(&mut journal, &dispatch, outcome, &clock).unwrap();
+        assert_eq!(report.status, ReconcileStatus::RejectedDuplicateOrStale);
+        assert_eq!(report.code, "correlation_mismatch");
+        assert!(!report.worker_stopped);
+        assert!(!report.recoverable);
+        assert_eq!(journal.view().revision.unwrap(), rev_before);
+        assert_eq!(journal.view().tasks["a"].status, TaskStatus::Running);
+        assert_eq!(journal.scheduler_status(&clock).unwrap().active_attempts, 1);
+    }
 }
 
 #[test]
@@ -677,6 +780,7 @@ Options:
 #[test]
 fn codex_adapter_executes_using_probed_flags_and_extracts_session_and_result() {
     let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-a");
     let clock = FakeClock::at(100);
     let mut journal = fixture.configured(policy(1, 2), &clock);
 
@@ -706,6 +810,7 @@ Usage: codex exec [OPTIONS] [PROMPT]
         "artifacts": []
     })
     .to_string();
+    runner.set_workspace_mutation("app/a.txt", "in-scope change\n");
     runner.set_last_message(&result_json);
     let jsonl_stdout = format!(
         "{{\"type\":\"thread.started\",\"thread_id\":\"th_12345\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
@@ -720,7 +825,7 @@ Usage: codex exec [OPTIONS] [PROMPT]
         &adapter,
         "a",
         "codex-host",
-        &fixture.root,
+        &workdir,
         ExecutionPolicy::WorkspaceWrite,
         &cancel,
         &clock,
@@ -747,6 +852,7 @@ Usage: codex exec [OPTIONS] [PROMPT]
 #[test]
 fn codex_adapter_handles_minimal_flags_timeout_cancel_crash_invalid_json_and_missing_binary() {
     let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-minimal");
     let clock = FakeClock::at(100);
     let mut journal = fixture.configured(policy(1, 10), &clock);
 
@@ -761,7 +867,7 @@ fn codex_adapter_handles_minimal_flags_timeout_cancel_crash_invalid_json_and_mis
         &missing_adapter,
         "a",
         "codex-host",
-        &fixture.root,
+        &workdir,
         ExecutionPolicy::ReadOnly,
         &cancel,
         &clock,
@@ -770,8 +876,8 @@ fn codex_adapter_handles_minimal_flags_timeout_cancel_crash_invalid_json_and_mis
     assert_eq!(missing_report.status, ReconcileStatus::HostUnavailable);
     assert_eq!(missing_report.attempt_id, None);
 
-    // 2. Minimal CLI (no --json, no --output-file, no stdin flag) passes prompt as arg.
-    let minimal_help = "Usage: codex exec [PROMPT]\n";
+    // 2. Minimal CLI (with required --sandbox, but no --json, no --output-file, no stdin flag) passes prompt as arg.
+    let minimal_help = "Usage: codex exec --sandbox <MODE> [PROMPT]\n";
     let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
     for _ in 0..2 {
         runner.push_ok(0, "codex-cli 0.1.0\n", "", false, false);
@@ -786,7 +892,7 @@ fn codex_adapter_handles_minimal_flags_timeout_cancel_crash_invalid_json_and_mis
         &minimal_adapter,
         "a",
         "codex-host",
-        &fixture.root,
+        &workdir,
         ExecutionPolicy::ReadOnly,
         &cancel,
         &clock,
@@ -819,7 +925,7 @@ fn codex_adapter_handles_minimal_flags_timeout_cancel_crash_invalid_json_and_mis
         &minimal_adapter,
         "a",
         "codex-host",
-        &fixture.root,
+        &workdir,
         ExecutionPolicy::ReadOnly,
         &cancel,
         &clock,
@@ -849,7 +955,7 @@ fn codex_adapter_handles_minimal_flags_timeout_cancel_crash_invalid_json_and_mis
         &minimal_adapter,
         "a",
         "codex-host",
-        &fixture.root,
+        &workdir,
         ExecutionPolicy::ReadOnly,
         &cancel,
         &clock,
@@ -857,6 +963,229 @@ fn codex_adapter_handles_minimal_flags_timeout_cancel_crash_invalid_json_and_mis
     .unwrap();
     assert_eq!(unstopped_report.status, ReconcileStatus::BlockedUnstopped);
     assert!(!unstopped_report.worker_stopped);
+}
+
+#[test]
+fn codex_adapter_fails_closed_when_sandbox_flag_is_missing() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-no-sandbox");
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let no_sandbox_help = "Usage: codex exec --json [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    runner.push_ok(0, "codex-cli 0.1.0\n", "", false, false);
+    runner.push_ok(0, no_sandbox_help, "", false, false);
+    runner.push_ok(0, "codex-cli 0.1.0\n", "", false, false);
+    runner.push_ok(0, no_sandbox_help, "", false, false);
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
+    let caps = adapter.probe();
+    assert!(!caps.available);
+    assert!(!caps.supports_sandbox_flag);
+    assert!(
+        caps.unavailable_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--sandbox")
+    );
+
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.status, ReconcileStatus::HostUnavailable);
+    assert_eq!(report.attempt_id, None);
+    assert_eq!(journal.view().tasks["a"].status, TaskStatus::Ready);
+}
+
+#[test]
+fn codex_adapter_enforces_workspace_isolation_and_write_scope() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-scope");
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 5), &clock);
+
+    let sandbox_help = "Usage: codex exec --sandbox <MODE> --json [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
+    let cancel = CancelToken::new();
+
+    // 1. Refuse WorkspaceWrite directly in repo root containing .storyflow/.
+    let dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+    runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    runner.push_ok(0, sandbox_help, "", false, false);
+    let root_req = AdapterRequest {
+        schema: ADAPTER_SCHEMA,
+        dispatch: dispatch.clone(),
+        workdir: fixture.root.clone(),
+        timeout_ms: 10_000,
+        policy: ExecutionPolicy::WorkspaceWrite,
+    };
+    let root_outcome = adapter.execute(&root_req, &cancel);
+    assert!(matches!(
+        root_outcome,
+        AdapterOutcome::HostUnavailable { ref detail, .. } if detail.contains(".storyflow/")
+    ));
+    let root_report = reconcile_outcome(&mut journal, &dispatch, root_outcome, &clock).unwrap();
+    assert_eq!(root_report.status, ReconcileStatus::HostUnavailable);
+
+    journal
+        .retry_task(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "retry in isolated worktree",
+            &clock,
+        )
+        .unwrap();
+
+    // 2. Reject out-of-scope modification under WorkspaceWrite (task a touches app/b.txt).
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": task_rev(&journal, "a") + 1,
+        "status": "succeeded",
+        "report": "claimed success despite out-of-scope write",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("app/b.txt", "out of scope edit\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+    let oos_report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(oos_report.status, ReconcileStatus::Blocked);
+    assert_eq!(oos_report.code, "invalid_output");
+    assert!(oos_report.detail.contains("app/b.txt"));
+    assert_eq!(journal.view().tasks["a"].status, TaskStatus::Blocked);
+
+    journal
+        .retry_task(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "retry under read-only",
+            &clock,
+        )
+        .unwrap();
+
+    // 3. Reject any workspace modification under ReadOnly even if inside write_scope.
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let ro_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": task_rev(&journal, "a") + 1,
+        "status": "succeeded",
+        "report": "modified file during read-only",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("app/a.txt", "unexpected write in read-only\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&ro_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+    let ro_report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(ro_report.status, ReconcileStatus::Blocked);
+    assert_eq!(ro_report.code, "invalid_output");
+    assert!(ro_report.detail.contains("app/a.txt"));
+
+    // 4. Refuse WorkspaceWrite when task write_scope is empty.
+    journal
+        .retry_task(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "retry with empty write_scope check",
+            &clock,
+        )
+        .unwrap();
+    let mut empty_scope_dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+    empty_scope_dispatch.packet.task.spec.write_scope.clear();
+    runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    runner.push_ok(0, sandbox_help, "", false, false);
+    let empty_req = AdapterRequest {
+        schema: ADAPTER_SCHEMA,
+        dispatch: empty_scope_dispatch.clone(),
+        workdir: fixture.isolated_workdir("wt-empty"),
+        timeout_ms: 10_000,
+        policy: ExecutionPolicy::WorkspaceWrite,
+    };
+    let empty_outcome = adapter.execute(&empty_req, &cancel);
+    assert!(matches!(
+        empty_outcome,
+        AdapterOutcome::HostUnavailable { ref detail, .. } if detail.contains("empty write_scope")
+    ));
+    let empty_report =
+        reconcile_outcome(&mut journal, &empty_scope_dispatch, empty_outcome, &clock).unwrap();
+    assert_eq!(empty_report.status, ReconcileStatus::HostUnavailable);
 }
 
 #[test]

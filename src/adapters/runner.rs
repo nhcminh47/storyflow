@@ -166,6 +166,20 @@ pub fn reconcile_outcome(
         ));
     }
 
+    // Reject misrouted outcomes before any state transition or lease release.
+    if let Some(correlation) = outcome.correlation()
+        && !correlation.matches_lease(&dispatch.lease)
+    {
+        return Ok(rejected_report(
+            "correlation_mismatch",
+            "adapter correlation attempt_id/lease_id/owner does not match dispatch",
+            task_id,
+            attempt_id,
+            session_id,
+            journal.view().revision,
+        ));
+    }
+
     let rev = journal
         .view()
         .revision

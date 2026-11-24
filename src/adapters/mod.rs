@@ -207,15 +207,19 @@ pub enum AdapterOutcome {
 }
 
 impl AdapterOutcome {
-    pub fn session_id(&self) -> Option<&str> {
+    pub fn correlation(&self) -> Option<&SessionCorrelation> {
         match self {
             Self::Completed { correlation, .. }
             | Self::Cancelled { correlation, .. }
             | Self::TimedOut { correlation, .. }
             | Self::HostCrashed { correlation, .. }
-            | Self::InvalidOutput { correlation, .. } => Some(&correlation.session_id),
+            | Self::InvalidOutput { correlation, .. } => Some(correlation),
             Self::HostUnavailable { .. } => None,
         }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.correlation().map(|c| c.session_id.as_str())
     }
 
     pub fn worker_stopped(&self) -> bool {
