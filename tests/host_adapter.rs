@@ -17,7 +17,10 @@ use storyflow::{
         codex::{CodexCommandRunner, ProcessCommandRunner},
         dispatch_and_run, reconcile_outcome,
     },
-    security::process::{ControlledResult, HostCommandSpec, ProcessError, ProcessResult},
+    integration::{IntegrationCoordinator, IntegrationPhase},
+    security::process::{
+        ControlledResult, HostCommandSpec, ProcessError, ProcessResult, git_executable,
+    },
     tasks::*,
 };
 
@@ -1905,6 +1908,275 @@ fn codex_adapter_reports_unstopped_when_containment_is_escapable() {
         !workdir.join("app/a.txt").exists(),
         "unconfirmed worker writes must not be promoted to workdir"
     );
+}
+
+#[test]
+fn codex_adapter_respects_case_sensitivity_in_task_scopes() {
+    let fixture = Fixture::new();
+    let workdir = fixture.root.join("worktrees/wt-case");
+    fs::create_dir_all(workdir.join("secret")).unwrap();
+    fs::write(workdir.join("secret/token.txt"), "lowercase secret\n").unwrap();
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(workdir.join("Secret")).unwrap();
+        fs::write(workdir.join("Secret/allowed.txt"), "exact case\n").unwrap();
+    }
+
+    let clock = FakeClock::at(100);
+    let mut case_spec = TaskSpec {
+        id: "a".into(),
+        story: STORY.into(),
+        prerequisites: Vec::new(),
+        stage: TaskStage::Plan,
+        read_scope: vec!["Secret".into()],
+        write_scope: vec!["Secret/out.txt".into()],
+        acceptance_criteria: vec!["AC1 verified".into()],
+        decision_owner: "orchestrator".into(),
+    };
+    let case_graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: "1".repeat(40),
+        story_revision: 0,
+        stage: TaskStage::Plan,
+        tasks: vec![case_spec.clone()],
+    };
+    let mut case_context = fixture.context.clone();
+    case_context.scope = vec!["Secret".into()];
+    let mut journal = TaskJournal::open(&fixture.root, case_context).unwrap();
+    journal.initialize(case_graph).unwrap();
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(1, 5), &clock)
+        .unwrap();
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+
+    // Unconfined runner must treat `secret/token.txt` as outside `read_scope: ["Secret"]`.
+    let unconfined = Arc::new(
+        MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_read_root_confinement(false),
+    );
+    for _ in 0..2 {
+        unconfined.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        unconfined.push_ok(0, sandbox_help, "", false, false);
+    }
+    let cancel = CancelToken::new();
+    let unconfined_adapter =
+        CodexAdapter::with_runner(CodexAdapterConfig::default(), unconfined.clone());
+    let refused = run_task(
+        &mut journal,
+        &unconfined_adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(refused.status, ReconcileStatus::HostUnavailable);
+    assert!(refused.detail.contains("secret"), "{refused:?}");
+    assert!(unconfined.observed_exec_paths().is_empty());
+
+    // Confined runner excludes `secret/token.txt` from staging and blocks lowercase write `secret/out.txt`.
+    journal
+        .retry_task(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "retry with confined runner",
+            &clock,
+        )
+        .unwrap();
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    case_spec.id = "a".into();
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": task_rev(&journal, "a") + 1,
+        "status": "succeeded",
+        "report": "attempted wrong-case write",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("secret/out.txt", "wrong case leak\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
+    let wrong_case = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(wrong_case.status, ReconcileStatus::Blocked);
+    assert_eq!(wrong_case.code, "invalid_output");
+    assert!(
+        wrong_case.detail.contains("secret/out.txt"),
+        "{wrong_case:?}"
+    );
+    let seen = runner.observed_exec_paths();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        !seen[0].iter().any(|p| p == "secret/token.txt"),
+        "wrong-case entry must not be staged: {:?}",
+        seen[0]
+    );
+    #[cfg(unix)]
+    assert!(
+        seen[0].contains(&"Secret/allowed.txt".to_owned()),
+        "{:?}",
+        seen[0]
+    );
+}
+
+#[test]
+fn codex_adapter_commits_promoted_writes_for_integration() {
+    fn run_git(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new(git_executable())
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    let fixture = Fixture::new();
+    let repo_root = fixture.root.join("git-repo");
+    fs::create_dir_all(repo_root.join("app")).unwrap();
+    fs::write(repo_root.join(".gitignore"), ".storyflow/\n").unwrap();
+    fs::write(repo_root.join("app/seed.txt"), "seed\n").unwrap();
+
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.name", "test"]);
+    run_git(&repo_root, &["config", "user.email", "test@local"]);
+    run_git(&repo_root, &["add", ".gitignore", "app/seed.txt"]);
+    run_git(&repo_root, &["commit", "-m", "initial baseline"]);
+    let base = run_git(&repo_root, &["rev-parse", "HEAD"]);
+    fs::create_dir_all(repo_root.join(format!(".storyflow/{STORY}/events"))).unwrap();
+
+    let context = RunContext {
+        story: STORY.into(),
+        base: base.clone(),
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        blocked: false,
+        scope: vec!["app".into()],
+        protected: Vec::new(),
+    };
+    let mut impl_spec = spec("a", &[]);
+    impl_spec.stage = TaskStage::Implement;
+    let graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base,
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        tasks: vec![impl_spec],
+    };
+
+    let mut journal = TaskJournal::open(&repo_root, context.clone()).unwrap();
+    journal.initialize(graph.clone()).unwrap();
+    let clock = FakeClock::at(100);
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(1, 2), &clock)
+        .unwrap();
+    let dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+
+    let coordinator = IntegrationCoordinator::new(&repo_root, context).unwrap();
+    let worktree = coordinator
+        .prepare_worktree(journal.view(), Some(&graph), "a")
+        .unwrap();
+    let workdir = repo_root.join(&worktree.path);
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    runner.push_ok(0, sandbox_help, "", false, false);
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": dispatch.packet.task.revision,
+        "status": "succeeded",
+        "report": "created app/a.txt in staged dir",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("app/a.txt", "implemented in git worktree\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let req = AdapterRequest {
+        schema: ADAPTER_SCHEMA,
+        dispatch: dispatch.clone(),
+        workdir: workdir.clone(),
+        timeout_ms: 10_000,
+        policy: ExecutionPolicy::WorkspaceWrite,
+    };
+    let outcome = adapter.execute(&req, &cancel);
+    match &outcome {
+        AdapterOutcome::Completed { result, .. } => {
+            assert!(
+                result.commit.is_some(),
+                "adapter must pin commit in git worktree"
+            );
+        }
+        other => panic!("expected Completed outcome, got {other:?}"),
+    }
+
+    let report = reconcile_outcome(&mut journal, &dispatch, outcome, &clock).unwrap();
+    assert_eq!(report.status, ReconcileStatus::Applied, "{report:?}");
+
+    let status = coordinator.integrate(journal.view(), Some(&graph)).unwrap();
+    assert_eq!(
+        status.phase,
+        IntegrationPhase::Ready,
+        "{:?}",
+        status.blockers
+    );
+    assert!(status.candidate_commit.is_some());
 }
 
 #[test]

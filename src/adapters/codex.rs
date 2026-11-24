@@ -7,7 +7,8 @@ use super::{
 use crate::{
     config::BUILTIN_PROTECTED,
     security::process::{
-        ControlledResult, HostCommandSpec, ProcessError, host_executable, run_host_command,
+        CommandSpec, ControlledResult, HostCommandSpec, ProcessError, git_executable,
+        host_executable, run as run_process, run_host_command,
     },
     tasks::{Artifact, ResultStatus, SCHEMA, WorkerResult},
 };
@@ -688,7 +689,7 @@ impl HostAdapter for CodexAdapter {
             }
         };
 
-        let result = WorkerResult {
+        let mut result = WorkerResult {
             schema: SCHEMA,
             story: envelope.story,
             task: envelope.task,
@@ -708,19 +709,76 @@ impl HostAdapter for CodexAdapter {
 
         if worker_stopped
             && request.policy == ExecutionPolicy::WorkspaceWrite
-            && let Err(detail) = apply_staged_writes(
+            && result.status == ResultStatus::Succeeded
+        {
+            let promoted = match apply_staged_writes(
                 staging_dir.path(),
                 &request.workdir,
                 &before_snapshot,
                 &after_snapshot,
                 &request.dispatch.packet.task.spec.write_scope,
-            )
-        {
-            return AdapterOutcome::InvalidOutput {
-                correlation,
-                worker_stopped,
-                detail: sanitize_reason(&detail),
+            ) {
+                Ok(promoted) => promoted,
+                Err(detail) => {
+                    return AdapterOutcome::InvalidOutput {
+                        correlation,
+                        worker_stopped,
+                        detail: sanitize_reason(&detail),
+                    };
+                }
             };
+
+            let has_git = workdir_is_git_worktree(&request.workdir);
+            if has_git && result.commit.is_none() {
+                if promoted.paths.is_empty() {
+                    let _ = rollback_workdir_promotion(&request.workdir, &promoted.backups);
+                    return AdapterOutcome::InvalidOutput {
+                        correlation,
+                        worker_stopped,
+                        detail: "codex reported succeeded for WorkspaceWrite task in Git worktree without producing write_scope changes to commit".to_owned(),
+                    };
+                }
+                match commit_promoted_writes(
+                    &request.workdir,
+                    &promoted.paths,
+                    &request.dispatch.packet.story,
+                    &request.dispatch.packet.task.spec.id,
+                    request.dispatch.packet.task.revision,
+                ) {
+                    Ok(head_after) => {
+                        result.commit = Some(head_after);
+                        if let Err(err) =
+                            super::runner::validate_worker_result(&result, &request.dispatch)
+                        {
+                            return AdapterOutcome::InvalidOutput {
+                                correlation,
+                                worker_stopped,
+                                detail: sanitize_reason(&format!(
+                                    "invalid codex worker result after commit: {err}"
+                                )),
+                            };
+                        }
+                    }
+                    Err(commit_err) => {
+                        let _ = unstage_paths(&request.workdir, &promoted.paths);
+                        let rollback_errs =
+                            rollback_workdir_promotion(&request.workdir, &promoted.backups);
+                        let detail = if rollback_errs.is_empty() {
+                            commit_err
+                        } else {
+                            format!(
+                                "{commit_err} (rollback failed: {})",
+                                rollback_errs.join("; ")
+                            )
+                        };
+                        return AdapterOutcome::InvalidOutput {
+                            correlation,
+                            worker_stopped,
+                            detail: sanitize_reason(&detail),
+                        };
+                    }
+                }
+            }
         }
 
         AdapterOutcome::Completed {
@@ -1004,8 +1062,8 @@ fn stage_read_scope(
     read_scope: &[String],
     max_bytes: usize,
 ) -> Result<(), StageError> {
-    let folded_scopes: Vec<String> = read_scope.iter().map(|s| fold_path(s)).collect();
-    if folded_scopes.is_empty() {
+    let norm_scopes: Vec<String> = read_scope.iter().map(|s| nfc_path(s)).collect();
+    if norm_scopes.is_empty() {
         return Ok(());
     }
     let mut copied_bytes = 0usize;
@@ -1014,7 +1072,7 @@ fn stage_read_scope(
         workdir,
         workdir,
         staging_root,
-        &folded_scopes,
+        &norm_scopes,
         max_bytes,
         &mut copied_bytes,
         &mut dir_modes,
@@ -1029,7 +1087,7 @@ fn stage_dir_entries(
     workdir: &Path,
     dir: &Path,
     staging_root: &Path,
-    folded_scopes: &[String],
+    norm_scopes: &[String],
     max_bytes: usize,
     copied_bytes: &mut usize,
     dir_modes: &mut Vec<(PathBuf, u32)>,
@@ -1052,13 +1110,9 @@ fn stage_dir_entries(
         if rel_str.is_empty() || is_protected_path(&rel_str) {
             continue;
         }
-        let folded = fold_path(&rel_str);
-        let in_read = folded_scopes
-            .iter()
-            .any(|scope| within_path(&folded, scope));
-        let is_ancestor = folded_scopes
-            .iter()
-            .any(|scope| within_path(scope, &folded));
+        let norm = nfc_path(&rel_str);
+        let in_read = norm_scopes.iter().any(|scope| within_path(&norm, scope));
+        let is_ancestor = norm_scopes.iter().any(|scope| within_path(scope, &norm));
         if !in_read && !is_ancestor {
             continue;
         }
@@ -1077,7 +1131,7 @@ fn stage_dir_entries(
                 workdir,
                 &path,
                 staging_root,
-                folded_scopes,
+                norm_scopes,
                 max_bytes,
                 copied_bytes,
                 dir_modes,
@@ -1111,16 +1165,16 @@ fn stage_dir_entries(
 }
 
 fn find_unscoped_workdir_entries(workdir: &Path, read_scope: &[String]) -> io::Result<Vec<String>> {
-    let folded_scopes: Vec<String> = read_scope.iter().map(|s| fold_path(s)).collect();
+    let norm_scopes: Vec<String> = read_scope.iter().map(|s| nfc_path(s)).collect();
     let mut unscoped = Vec::new();
-    collect_unscoped_entries(workdir, workdir, &folded_scopes, &mut unscoped)?;
+    collect_unscoped_entries(workdir, workdir, &norm_scopes, &mut unscoped)?;
     Ok(unscoped)
 }
 
 fn collect_unscoped_entries(
     workdir: &Path,
     dir: &Path,
-    folded_scopes: &[String],
+    norm_scopes: &[String],
     unscoped: &mut Vec<String>,
 ) -> io::Result<()> {
     const MAX_SAMPLE: usize = 16;
@@ -1146,17 +1200,13 @@ fn collect_unscoped_entries(
             unscoped.push(rel_str);
             continue;
         }
-        let folded = fold_path(&rel_str);
-        let in_read = folded_scopes
-            .iter()
-            .any(|scope| within_path(&folded, scope));
-        let is_ancestor = folded_scopes
-            .iter()
-            .any(|scope| within_path(scope, &folded));
+        let norm = nfc_path(&rel_str);
+        let in_read = norm_scopes.iter().any(|scope| within_path(&norm, scope));
+        let is_ancestor = norm_scopes.iter().any(|scope| within_path(scope, &norm));
         let meta = fs::symlink_metadata(&path)?;
         if meta.file_type().is_dir() {
             if in_read || is_ancestor {
-                collect_unscoped_entries(workdir, &path, folded_scopes, unscoped)?;
+                collect_unscoped_entries(workdir, &path, norm_scopes, unscoped)?;
             } else {
                 unscoped.push(rel_str);
             }
@@ -1165,6 +1215,12 @@ fn collect_unscoped_entries(
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct PromotedWrites {
+    paths: Vec<String>,
+    backups: BTreeMap<String, WorkdirBackupEntry>,
 }
 
 enum StagedWriteOp {
@@ -1185,6 +1241,7 @@ enum StagedWriteOp {
     },
 }
 
+#[derive(Debug)]
 enum WorkdirBackupEntry {
     Missing,
     Dir { mode: u32 },
@@ -1197,7 +1254,7 @@ fn apply_staged_writes(
     before: &WorkspaceSnapshot,
     after: &WorkspaceSnapshot,
     write_scope: &[String],
-) -> Result<(), String> {
+) -> Result<PromotedWrites, String> {
     apply_staged_writes_with(
         staging_root,
         workdir,
@@ -1215,9 +1272,10 @@ fn apply_staged_writes_with(
     after: &WorkspaceSnapshot,
     write_scope: &[String],
     on_write: impl FnMut(&str) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<PromotedWrites, String> {
     let all_paths: BTreeSet<&String> = before.entries.keys().chain(after.entries.keys()).collect();
     let mut ops = Vec::new();
+    let mut promoted_paths = Vec::new();
 
     for path in all_paths {
         let prev = before.entries.get(path);
@@ -1230,15 +1288,15 @@ fn apply_staged_writes_with(
                 "refusing protected path promotion from staging: {path}"
             ));
         }
-        let folded_path = fold_path(path);
+        let norm_path = nfc_path(path);
         let in_write_scope = write_scope
             .iter()
-            .any(|scope| within_path(&folded_path, &fold_path(scope)));
+            .any(|scope| within_path(&norm_path, &nfc_path(scope)));
         let created_parent_for_scope = prev.is_none()
             && matches!(curr, Some(SnapshotEntry::Dir { .. }))
             && write_scope
                 .iter()
-                .any(|scope| within_path(&fold_path(scope), &folded_path));
+                .any(|scope| within_path(&nfc_path(scope), &norm_path));
         if !in_write_scope && !created_parent_for_scope {
             return Err(format!(
                 "refusing out-of-scope promotion from staging: {path}"
@@ -1259,6 +1317,7 @@ fn apply_staged_writes_with(
                 let bytes = fs::read(&staged_path).map_err(|err| {
                     format!("failed to read staged output {path} before promotion: {err}")
                 })?;
+                promoted_paths.push(path.clone());
                 ops.push(StagedWriteOp::WriteFile {
                     rel: path.clone(),
                     bytes,
@@ -1272,6 +1331,7 @@ fn apply_staged_writes_with(
                 });
             }
             (Some(SnapshotEntry::File { .. }), None) => {
+                promoted_paths.push(path.clone());
                 ops.push(StagedWriteOp::RemoveFile { rel: path.clone() });
             }
             (Some(SnapshotEntry::Dir { .. }), None) => {
@@ -1290,7 +1350,10 @@ fn apply_staged_writes_with(
     }
 
     if ops.is_empty() {
-        return Ok(());
+        return Ok(PromotedWrites {
+            paths: Vec::new(),
+            backups: BTreeMap::new(),
+        });
     }
 
     let backups = capture_workdir_backups(workdir, &ops)?;
@@ -1304,7 +1367,134 @@ fn apply_staged_writes_with(
             rollback_errors.join("; ")
         ));
     }
-    Ok(())
+    Ok(PromotedWrites {
+        paths: promoted_paths,
+        backups,
+    })
+}
+
+fn workdir_is_git_worktree(workdir: &Path) -> bool {
+    if fs::symlink_metadata(workdir.join(".git")).is_err() {
+        return false;
+    }
+    let Ok(toplevel) = run_git_checked(
+        workdir,
+        &["rev-parse".to_owned(), "--show-toplevel".to_owned()],
+    ) else {
+        return false;
+    };
+    let Ok(canon_work) = fs::canonicalize(workdir) else {
+        return false;
+    };
+    let Ok(canon_top) = fs::canonicalize(Path::new(&toplevel)) else {
+        return false;
+    };
+    canon_work == canon_top
+}
+
+fn run_git_checked(workdir: &Path, args: &[String]) -> Result<String, String> {
+    let program = git_executable().to_string_lossy().into_owned();
+    let res = run_process(
+        &CommandSpec {
+            program,
+            args: args.to_vec(),
+            timeout: Duration::from_secs(30),
+        },
+        workdir,
+    )
+    .map_err(|err| format!("git execution failed: {err}"))?;
+    if res.timed_out {
+        return Err("git command timed out while pinning worker commit".to_owned());
+    }
+    if !res.status.is_some_and(|s| s.success()) {
+        let stderr = String::from_utf8_lossy(&res.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&res.stdout).trim().to_owned();
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!("git command failed: {msg}"));
+    }
+    Ok(String::from_utf8_lossy(&res.stdout).trim().to_owned())
+}
+
+fn commit_promoted_writes(
+    workdir: &Path,
+    promoted_paths: &[String],
+    story: &str,
+    task: &str,
+    task_revision: u64,
+) -> Result<String, String> {
+    let head_before = run_git_checked(
+        workdir,
+        &[
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            "HEAD".to_owned(),
+        ],
+    )?;
+    let hooks_dir = TempArtifactsDir::new()
+        .map_err(|err| format!("failed to allocate empty git hooks dir: {err}"))?;
+    let hooks_arg = format!("core.hooksPath={}", hooks_dir.path().display());
+
+    let mut add_args = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
+    add_args.extend(promoted_paths.iter().cloned());
+    run_git_checked(workdir, &add_args)?;
+
+    let mut diff_args = vec![
+        "diff".to_owned(),
+        "--cached".to_owned(),
+        "--name-only".to_owned(),
+        "--".to_owned(),
+    ];
+    diff_args.extend(promoted_paths.iter().cloned());
+    let staged_diff = run_git_checked(workdir, &diff_args)?;
+    if staged_diff.trim().is_empty() {
+        return Err(
+            "codex promoted files produced no git diff to commit for WorkspaceWrite task"
+                .to_owned(),
+        );
+    }
+
+    let message = format!("storyflow({story}): task {task} r{task_revision}");
+    let mut commit_args = vec![
+        "-c".to_owned(),
+        "user.name=storyflow".to_owned(),
+        "-c".to_owned(),
+        "user.email=storyflow@local".to_owned(),
+        "-c".to_owned(),
+        "commit.gpgsign=false".to_owned(),
+        "-c".to_owned(),
+        hooks_arg,
+        "commit".to_owned(),
+        "--no-verify".to_owned(),
+        "-m".to_owned(),
+        message,
+        "--".to_owned(),
+    ];
+    commit_args.extend(promoted_paths.iter().cloned());
+    run_git_checked(workdir, &commit_args)?;
+
+    let head_after = run_git_checked(
+        workdir,
+        &[
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            "HEAD".to_owned(),
+        ],
+    )?;
+    if head_after == head_before {
+        return Err("git commit did not advance HEAD in worker worktree".to_owned());
+    }
+    Ok(head_after)
+}
+
+fn unstage_paths(workdir: &Path, promoted_paths: &[String]) -> Result<(), String> {
+    let mut reset_args = vec![
+        "reset".to_owned(),
+        "-q".to_owned(),
+        "HEAD".to_owned(),
+        "--".to_owned(),
+    ];
+    reset_args.extend(promoted_paths.iter().cloned());
+    run_git_checked(workdir, &reset_args).map(|_| ())
 }
 
 fn capture_workdir_backups(
@@ -1812,15 +2002,15 @@ fn verify_and_restore_post_run(
             violations.push(path.clone());
             continue;
         }
-        let folded_path = fold_path(path);
+        let norm_path = nfc_path(path);
         let in_write_scope = write_scope
             .iter()
-            .any(|scope| within_path(&folded_path, &fold_path(scope)));
+            .any(|scope| within_path(&norm_path, &nfc_path(scope)));
         let created_parent_for_scope = prev.is_none()
             && matches!(curr, Some(SnapshotEntry::Dir { .. }))
             && write_scope
                 .iter()
-                .any(|scope| within_path(&fold_path(scope), &folded_path));
+                .any(|scope| within_path(&nfc_path(scope), &norm_path));
         if !in_write_scope && !created_parent_for_scope {
             violations.push(path.clone());
         }
@@ -2125,6 +2315,10 @@ fn restore_mode(path: &Path, mode: u32) -> io::Result<()> {
         perms.set_readonly(mode != 0);
         fs::set_permissions(path, perms)
     }
+}
+
+fn nfc_path(value: &str) -> String {
+    value.nfc().collect()
 }
 
 fn fold_path(value: &str) -> String {
