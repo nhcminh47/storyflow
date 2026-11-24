@@ -1276,3 +1276,122 @@ fn retired_worktree_from_earlier_graph_remains_reachable_for_cleanup() {
     assert!(!cleaned.worktrees.contains_key("old-task"));
     assert!(!wt_old_dir.exists());
 }
+
+#[test]
+fn retired_unstopped_worktree_cannot_be_replaced_until_worker_stop_confirmed() {
+    let f = RepoFixture::new();
+    let ctx = f.init_story_in_implement();
+    let clock = FakeClock(Cell::new(1_000));
+    let coordinator = IntegrationCoordinator::new(&f.root, ctx.clone()).unwrap();
+
+    let graph1 = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: f.base.clone(),
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        tasks: vec![task_spec("shared-id", &[], &["messages/welcome.txt"])],
+    };
+    let mut journal = TaskJournal::open(&f.root, ctx.clone()).unwrap();
+    journal.initialize(graph1.clone()).unwrap();
+    journal
+        .configure_scheduler(
+            0,
+            SchedulerPolicy {
+                max_concurrency: 2,
+                max_attempts: 2,
+                lease_ms: 60_000,
+            },
+            &clock,
+        )
+        .unwrap();
+    let d1 = journal
+        .dispatch(1, "shared-id", 0, "worker-1", &clock)
+        .unwrap();
+    let wt1 = coordinator
+        .prepare_worktree(journal.view(), Some(&graph1), "shared-id")
+        .unwrap();
+    let wt1_dir = f.root.join(&wt1.path);
+    assert!(wt1_dir.is_dir());
+    drop(journal);
+
+    // Replace graph while `shared-id` attempt 1 has not confirmed stop.
+    f.flow(&["submit", STORY, "1", "block", "report.md"]);
+    f.flow(&["submit", STORY, "2", "resume", "report.md"]);
+    let mut ctx2 = ctx.clone();
+    ctx2.story_revision = 3;
+    let coordinator2 = IntegrationCoordinator::new(&f.root, ctx2.clone()).unwrap();
+    let graph2 = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: f.base.clone(),
+        story_revision: 3,
+        stage: TaskStage::Implement,
+        tasks: vec![task_spec("shared-id", &[], &["messages/welcome.txt"])],
+    };
+    let mut journal2 = TaskJournal::open(&f.root, ctx2).unwrap();
+    journal2.replace(2, graph2.clone()).unwrap();
+
+    // Even cleanup is refused while the retired worker is unstopped, and a crafted view with
+    // `shared-id` marked Running cannot replace/remove the retired worktree.
+    let err = coordinator2
+        .cleanup_worktree(journal2.view(), Some(&graph2), "shared-id")
+        .unwrap_err();
+    assert_eq!(err.code, "worker_stop_required");
+    assert!(wt1_dir.is_dir());
+
+    let mut synthetic_view = journal2.view().clone();
+    let task2 = synthetic_view.tasks.get_mut("shared-id").unwrap();
+    task2.status = TaskStatus::Running;
+    task2.revision += 1;
+    let new_rev = task2.revision;
+    let new_graph_rev = synthetic_view.scheduler.as_ref().unwrap().graph_revision;
+    synthetic_view.scheduler.as_mut().unwrap().attempts.insert(
+        "a2".into(),
+        AttemptState {
+            lease: LeaseToken {
+                attempt_id: "a2".into(),
+                lease_id: "l2".into(),
+                owner: "worker-2".into(),
+            },
+            graph_revision: new_graph_rev,
+            story_revision: 3,
+            task: "shared-id".into(),
+            task_revision: new_rev,
+            write_scope: vec!["messages/welcome.txt".into()],
+            phase: AttemptPhase::Leased,
+            dispatched_at_ms: 1_100,
+            heartbeat_at_ms: 1_100,
+            expires_at_ms: 61_100,
+            worker_stopped: false,
+            result: None,
+        },
+    );
+    let err = coordinator2
+        .prepare_worktree(&synthetic_view, Some(&graph2), "shared-id")
+        .unwrap_err();
+    assert_eq!(err.code, "worker_stop_required");
+    assert!(wt1_dir.is_dir());
+    assert!(
+        coordinator2
+            .status(journal2.view(), Some(&graph2))
+            .unwrap()
+            .worktrees
+            .contains_key("shared-id")
+    );
+
+    // After confirming the retired worker stopped, dispatch + worktree replacement succeeds.
+    journal2
+        .confirm_stopped(3, &d1.lease, "retired worker exited", &clock)
+        .unwrap();
+    let rev2 = journal2.view().tasks["shared-id"].revision;
+    let _d2 = journal2
+        .dispatch(4, "shared-id", rev2, "worker-2", &clock)
+        .unwrap();
+    let wt2 = coordinator2
+        .prepare_worktree(journal2.view(), Some(&graph2), "shared-id")
+        .unwrap();
+    assert_ne!(wt2.path, wt1.path);
+    assert!(!wt1_dir.exists());
+    assert!(f.root.join(&wt2.path).is_dir());
+}

@@ -359,20 +359,31 @@ impl IntegrationCoordinator {
             return Ok(existing.clone());
         }
 
-        // Remove any previous worktree for this task before provisioning the new one.
-        if let Some(old) = current.worktrees.remove(task_id)
-            && self.root.join(&old.path).exists()
-        {
-            if let Some(raw_commit) = task.result.as_ref().and_then(|r| r.commit.as_ref())
-                && let Ok(commit) = self.resolve_commit(raw_commit)
+        // Reject replacing/removing any previous worktree for this task while an earlier
+        // attempt is unstopped, and keep its cleanup record intact if removal fails.
+        if let Some(old) = current.worktrees.get(task_id).cloned() {
+            if let Some(old_attempt) = old.attempt_id.as_deref()
+                && is_attempt_unstopped(view, old_attempt)
             {
-                let input_ref = self.task_input_ref(old.graph_revision, task_id, old.task_revision);
-                let _ = self.git_checked(&["update-ref", &input_ref, &commit]);
+                return Err(error(
+                    "worker_stop_required",
+                    "prior worker for this task has not been confirmed stopped; keep its worktree until stop is confirmed",
+                ));
             }
-            let _ = self.remove_git_worktree(&old.path);
+            if self.root.join(&old.path).exists() {
+                if let Some(raw_commit) = task.result.as_ref().and_then(|r| r.commit.as_ref())
+                    && let Ok(commit) = self.resolve_commit(raw_commit)
+                {
+                    let input_ref =
+                        self.task_input_ref(old.graph_revision, task_id, old.task_revision);
+                    self.git_checked(&["update-ref", &input_ref, &commit])?;
+                }
+                self.remove_git_worktree(&old.path)?;
+            }
+            current.worktrees.remove(task_id);
         }
         if wt_dir.exists() {
-            let _ = self.remove_git_worktree(&relative_path);
+            self.remove_git_worktree(&relative_path)?;
         }
 
         create_dir(&self.worktrees_dir())?;
@@ -1594,6 +1605,14 @@ fn has_unstopped_worker(view: &TaskView, task_id: &str) -> bool {
     })
 }
 
+fn is_attempt_unstopped(view: &TaskView, attempt_id: &str) -> bool {
+    view.scheduler.as_ref().is_some_and(|s| {
+        s.attempts
+            .get(attempt_id)
+            .is_some_and(|a| !a.worker_stopped)
+    })
+}
+
 fn active_attempt_for_running_task(
     view: &TaskView,
     task_id: &str,
@@ -1602,17 +1621,25 @@ fn active_attempt_for_running_task(
     let Some(scheduler) = &view.scheduler else {
         return Ok(None);
     };
-    // Ensure no earlier unstopped worker for this task exists from another attempt.
+    let is_current_leased = |a: &&crate::tasks::AttemptState| {
+        a.graph_revision == scheduler.graph_revision
+            && a.task == task_id
+            && a.task_revision == task_revision
+            && a.phase == AttemptPhase::Leased
+    };
+    let has_other_unstopped = scheduler
+        .attempts
+        .values()
+        .any(|a| a.task == task_id && !a.worker_stopped && !is_current_leased(&a));
+    require(
+        !has_other_unstopped,
+        "worker_stop_required",
+        "an earlier worker attempt for this task has not been confirmed stopped",
+    )?;
     let active: Vec<_> = scheduler
         .attempts
         .values()
-        .filter(|a| {
-            a.graph_revision == scheduler.graph_revision
-                && a.task == task_id
-                && a.task_revision == task_revision
-                && a.phase == AttemptPhase::Leased
-                && !a.worker_stopped
-        })
+        .filter(|a| is_current_leased(a) && !a.worker_stopped)
         .collect();
     require(
         active.len() == 1,
