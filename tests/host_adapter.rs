@@ -1118,6 +1118,7 @@ fn codex_adapter_enforces_workspace_isolation_and_write_scope() {
     assert_eq!(oos_report.status, ReconcileStatus::Blocked);
     assert_eq!(oos_report.code, "invalid_output");
     assert!(oos_report.detail.contains("app/b.txt"));
+    assert!(!workdir.join("app/b.txt").exists());
     assert_eq!(journal.view().tasks["a"].status, TaskStatus::Blocked);
 
     journal
@@ -1170,6 +1171,40 @@ fn codex_adapter_enforces_workspace_isolation_and_write_scope() {
     assert_eq!(ro_report.status, ReconcileStatus::Blocked);
     assert_eq!(ro_report.code, "invalid_output");
     assert!(ro_report.detail.contains("app/a.txt"));
+    assert!(!workdir.join("app/a.txt").exists());
+
+    // 3b. Even when Codex crashes (exit 1) without JSON, out-of-scope edits are detected & rolled back.
+    journal
+        .retry_task(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "retry crash rollback check",
+            &clock,
+        )
+        .unwrap();
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    runner.set_workspace_mutation("app/b.txt", "dirty file left by crashed worker\n");
+    runner.push_ok(1, "", "worker crashed", false, false);
+    let crash_report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(crash_report.status, ReconcileStatus::Blocked);
+    assert_eq!(crash_report.code, "host_crashed");
+    assert!(crash_report.detail.contains("app/b.txt"));
+    assert!(crash_report.detail.contains("restored"));
+    assert!(!workdir.join("app/b.txt").exists());
 
     // 4. Refuse WorkspaceWrite when task write_scope is empty.
     journal
@@ -1264,6 +1299,10 @@ fn codex_adapter_protects_root_git_metadata_and_resolves_relative_executable() {
     assert_eq!(report.status, ReconcileStatus::Blocked);
     assert_eq!(report.code, "invalid_output");
     assert!(report.detail.contains(".git/config"));
+    assert_eq!(
+        fs::read_to_string(workdir.join(".git/config")).unwrap(),
+        "[core]\n\tbare = false\n"
+    );
 
     // Relative configured executable path must be canonicalized to an absolute path.
     let bin_path = fixture.root.join("codex-mock-bin");
@@ -1346,22 +1385,90 @@ fn codex_adapter_detects_permission_changes_and_preserves_contract_on_prompt_tru
         &clock,
     )
     .unwrap();
-    // Restore original permissions before Fixture::drop removes the directory on Windows.
-    fs::set_permissions(&protected_target, orig_perms).unwrap();
+    assert_eq!(
+        fs::metadata(&protected_target).unwrap().permissions(),
+        orig_perms,
+        "rollback must restore original file permissions automatically"
+    );
 
     assert_eq!(report.status, ReconcileStatus::Blocked);
     assert_eq!(report.code, "invalid_output");
     assert!(report.detail.contains("app/b.txt"));
 
-    // Prompt was truncated to <= 32768 bytes while preserving the full Constraints & JSON contract.
+    // All 64 acceptance criteria + Constraints & JSON contract are preserved intact.
     let calls = runner.calls();
     let exec_call = calls.last().unwrap();
     let prompt_bytes = exec_call.stdin.as_ref().unwrap();
-    assert!(prompt_bytes.len() <= 32_768);
+    assert!(prompt_bytes.len() <= 65_536);
     let prompt_str = std::str::from_utf8(prompt_bytes).unwrap();
-    assert!(prompt_str.contains("...[truncated]..."));
+    assert!(prompt_str.contains("AC-00:"));
+    assert!(prompt_str.contains("AC-63:"));
     assert!(prompt_str.contains("\nConstraints:\n"));
     assert!(prompt_str.contains("Return ONLY a JSON object with fields: story"));
+
+    // When huge prerequisites push total size past 65_536 bytes, only prerequisites are truncated.
+    journal
+        .retry_task(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "retry with large prerequisites",
+            &clock,
+        )
+        .unwrap();
+    let mut big_dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+    for i in 0..600 {
+        let dep_id = format!("dep-{i:03}");
+        big_dispatch.packet.prerequisites.insert(
+            dep_id.clone(),
+            WorkerResult {
+                schema: SCHEMA,
+                story: STORY.into(),
+                task: dep_id,
+                task_revision: 1,
+                status: ResultStatus::Succeeded,
+                report: "ok".to_owned(),
+                commit: Some("a".repeat(40)),
+                artifacts: Vec::new(),
+            },
+        );
+    }
+    let runner2 = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    runner2.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    runner2.push_ok(0, sandbox_help, "", false, false);
+    runner2.push_ok(
+        0,
+        "{\"type\":\"thread.started\",\"thread_id\":\"th_ok\"}\n",
+        "",
+        false,
+        false,
+    );
+    let adapter2 = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner2.clone());
+    let big_req = AdapterRequest {
+        schema: ADAPTER_SCHEMA,
+        dispatch: big_dispatch,
+        workdir: workdir.clone(),
+        timeout_ms: 10_000,
+        policy: ExecutionPolicy::ReadOnly,
+    };
+    let _ = adapter2.execute(&big_req, &cancel);
+    let big_call = runner2.calls().pop().unwrap();
+    let big_prompt_bytes = big_call.stdin.as_ref().unwrap();
+    assert!(big_prompt_bytes.len() <= 65_536);
+    let big_prompt = std::str::from_utf8(big_prompt_bytes).unwrap();
+    assert!(big_prompt.contains("AC-00:"));
+    assert!(big_prompt.contains("AC-63:"));
+    assert!(big_prompt.contains("...[prerequisites truncated]..."));
+    assert!(big_prompt.contains("\nConstraints:\n"));
+    assert!(big_prompt.contains("Return ONLY a JSON object with fields: story"));
 }
 
 #[test]

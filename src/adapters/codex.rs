@@ -28,7 +28,8 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 
 const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 5;
-const MAX_PROMPT_BYTES: usize = 32_768;
+const MAX_PROMPT_BYTES: usize = 65_536;
+const MAX_BACKUP_BYTES: usize = 32 * 1024 * 1024;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -334,7 +335,7 @@ impl HostAdapter for CodexAdapter {
             };
         }
 
-        let before_snapshot = match snapshot_workspace(&request.workdir) {
+        let before_snapshot = match snapshot_workspace(&request.workdir, true) {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 return AdapterOutcome::HostCrashed {
@@ -344,6 +345,17 @@ impl HostAdapter for CodexAdapter {
                     detail: sanitize_reason(&format!(
                         "failed to snapshot codex workspace before execution: {err}"
                     )),
+                };
+            }
+        };
+
+        let prompt = match build_prompt(request) {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                return AdapterOutcome::InvalidOutput {
+                    correlation: fallback_correlation,
+                    worker_stopped: true,
+                    detail: err.to_string(),
                 };
             }
         };
@@ -383,7 +395,6 @@ impl HostAdapter for CodexAdapter {
             };
         }
 
-        let prompt = build_prompt(request);
         let mut args = vec!["exec".to_owned()];
         if caps.supports_working_dir {
             args.push("--cd".to_owned());
@@ -455,19 +466,34 @@ impl HostAdapter for CodexAdapter {
             .unwrap_or_else(|| fallback_correlation.session_id.clone());
         let correlation = SessionCorrelation::from_lease(&request.dispatch.lease, session_id);
 
+        let scope_check = verify_and_restore_post_run(
+            &request.workdir,
+            &before_snapshot,
+            request.policy,
+            &request.dispatch.packet.task.spec.write_scope,
+        );
+
         if controlled.cancelled {
+            let reason = match scope_check {
+                Ok(()) => "cancelled by host request".to_owned(),
+                Err(msg) => sanitize_reason(&format!("cancelled by host request ({msg})")),
+            };
             return AdapterOutcome::Cancelled {
                 correlation,
                 worker_stopped: true,
-                reason: "cancelled by host request".to_owned(),
+                reason,
             };
         }
 
         if controlled.process.timed_out {
+            let reason = match scope_check {
+                Ok(()) => "codex execution timed out".to_owned(),
+                Err(msg) => sanitize_reason(&format!("codex execution timed out ({msg})")),
+            };
             return AdapterOutcome::TimedOut {
                 correlation,
                 worker_stopped: true,
-                reason: "codex execution timed out".to_owned(),
+                reason,
             };
         }
 
@@ -478,11 +504,24 @@ impl HostAdapter for CodexAdapter {
             } else {
                 stdout_text.trim()
             };
+            let base = format!("codex exited unsuccessfully: {detail_source}");
+            let detail = match scope_check {
+                Ok(()) => sanitize_reason(&base),
+                Err(msg) => sanitize_reason(&format!("{base}; {msg}")),
+            };
             return AdapterOutcome::HostCrashed {
                 correlation,
                 worker_stopped: true,
                 exit_code,
-                detail: sanitize_reason(&format!("codex exited unsuccessfully: {detail_source}")),
+                detail,
+            };
+        }
+
+        if let Err(detail) = scope_check {
+            return AdapterOutcome::InvalidOutput {
+                correlation,
+                worker_stopped: true,
+                detail: sanitize_reason(&detail),
             };
         }
 
@@ -520,31 +559,6 @@ impl HostAdapter for CodexAdapter {
                 };
             }
         };
-
-        let after_snapshot = match snapshot_workspace(&request.workdir) {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                return AdapterOutcome::InvalidOutput {
-                    correlation,
-                    worker_stopped: true,
-                    detail: sanitize_reason(&format!(
-                        "failed to verify codex workspace changes: {err}"
-                    )),
-                };
-            }
-        };
-        if let Err(detail) = verify_workspace_changes(
-            &before_snapshot,
-            &after_snapshot,
-            request.policy,
-            &request.dispatch.packet.task.spec.write_scope,
-        ) {
-            return AdapterOutcome::InvalidOutput {
-                correlation,
-                worker_stopped: true,
-                detail: sanitize_reason(&detail),
-            };
-        }
 
         AdapterOutcome::Completed {
             correlation,
@@ -688,7 +702,7 @@ fn extract_message_from_stdout(stdout: &str, json_output: bool) -> Option<String
     }
 }
 
-fn build_prompt(request: &AdapterRequest) -> String {
+fn build_prompt(request: &AdapterRequest) -> AdapterResult<String> {
     let packet = &request.dispatch.packet;
     let task = &packet.task;
     let constraints = format!(
@@ -700,7 +714,7 @@ fn build_prompt(request: &AdapterRequest) -> String {
         packet.story, task.spec.id, task.revision
     );
 
-    let mut body = format!(
+    let mut required_body = format!(
         "Storyflow task execution request\n\
          Story: {}\n\
          Base commit: {}\n\
@@ -726,48 +740,49 @@ fn build_prompt(request: &AdapterRequest) -> String {
         },
     );
     for ac in &task.spec.acceptance_criteria {
-        body.push_str("- ");
-        body.push_str(ac);
-        body.push('\n');
+        required_body.push_str("- ");
+        required_body.push_str(ac);
+        required_body.push('\n');
     }
+
+    if required_body.len() + constraints.len() > MAX_PROMPT_BYTES {
+        return Err(AdapterError::new(
+            "prompt_too_large",
+            "required task prompt, acceptance criteria, and output contract exceed byte budget",
+        ));
+    }
+
+    let mut prereqs = String::new();
     if !packet.prerequisites.is_empty() {
-        body.push_str("Completed prerequisites:\n");
+        prereqs.push_str("Completed prerequisites:\n");
         for (dep_id, dep_res) in &packet.prerequisites {
-            body.push_str(&format!(
+            prereqs.push_str(&format!(
                 "- {dep_id}: {:?} ({})\n",
                 dep_res.status,
                 dep_res.commit.as_deref().unwrap_or("no-commit")
             ));
         }
+        let prereq_budget = MAX_PROMPT_BYTES - required_body.len() - constraints.len();
+        if prereqs.len() > prereq_budget {
+            const MARKER: &str = "\n...[prerequisites truncated]...\n";
+            if prereq_budget >= MARKER.len() {
+                let mut end = prereq_budget - MARKER.len();
+                while !prereqs.is_char_boundary(end) {
+                    end -= 1;
+                }
+                prereqs.truncate(end);
+                prereqs.push_str(MARKER);
+            } else {
+                prereqs.clear();
+            }
+        }
     }
 
-    let body_budget = MAX_PROMPT_BYTES.saturating_sub(constraints.len());
-    if body.len() > body_budget {
-        const MARKER: &str = "\n...[truncated]...\n";
-        if body_budget >= MARKER.len() {
-            let mut end = body_budget - MARKER.len();
-            while !body.is_char_boundary(end) {
-                end -= 1;
-            }
-            body.truncate(end);
-            body.push_str(MARKER);
-        } else {
-            let mut end = body_budget;
-            while !body.is_char_boundary(end) {
-                end -= 1;
-            }
-            body.truncate(end);
-        }
-    }
-    body.push_str(&constraints);
-    if body.len() > MAX_PROMPT_BYTES {
-        let mut end = MAX_PROMPT_BYTES;
-        while !body.is_char_boundary(end) {
-            end -= 1;
-        }
-        body.truncate(end);
-    }
-    body
+    let mut prompt = String::with_capacity(required_body.len() + prereqs.len() + constraints.len());
+    prompt.push_str(&required_body);
+    prompt.push_str(&prereqs);
+    prompt.push_str(&constraints);
+    Ok(prompt)
 }
 
 fn output_schema_json() -> &'static str {
@@ -853,16 +868,27 @@ fn ensure_isolated_workspace(workdir: &Path, write_scope: &[String]) -> Result<(
     Ok(())
 }
 
-fn snapshot_workspace(root: &Path) -> io::Result<BTreeMap<String, SnapshotEntry>> {
-    let mut entries = BTreeMap::new();
-    collect_snapshot(root, root, &mut entries)?;
-    Ok(entries)
+struct WorkspaceSnapshot {
+    entries: BTreeMap<String, SnapshotEntry>,
+    backups: BTreeMap<String, Vec<u8>>,
+    backup_bytes: usize,
+}
+
+fn snapshot_workspace(root: &Path, capture_backups: bool) -> io::Result<WorkspaceSnapshot> {
+    let mut snapshot = WorkspaceSnapshot {
+        entries: BTreeMap::new(),
+        backups: BTreeMap::new(),
+        backup_bytes: 0,
+    };
+    collect_snapshot(root, root, capture_backups, &mut snapshot)?;
+    Ok(snapshot)
 }
 
 fn collect_snapshot(
     root: &Path,
     dir: &Path,
-    entries: &mut BTreeMap<String, SnapshotEntry>,
+    capture_backups: bool,
+    snapshot: &mut WorkspaceSnapshot,
 ) -> io::Result<()> {
     let mut children: Vec<_> = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
     children.sort_by_key(|entry| entry.file_name());
@@ -883,49 +909,91 @@ fn collect_snapshot(
         let file_type = meta.file_type();
         if file_type.is_symlink() {
             let target = fs::read_link(&path)?;
-            entries.insert(
+            snapshot.entries.insert(
                 rel_str,
                 SnapshotEntry::Symlink(target.to_string_lossy().into_owned()),
             );
         } else if file_type.is_dir() {
-            entries.insert(
+            snapshot.entries.insert(
                 rel_str,
                 SnapshotEntry::Dir {
                     mode: entry_mode(&meta),
                 },
             );
-            collect_snapshot(root, &path, entries)?;
+            collect_snapshot(root, &path, capture_backups, snapshot)?;
         } else if file_type.is_file() {
             let mode = entry_mode(&meta);
             let mut file = fs::File::open(&path)?;
             let mut hasher = Sha256::new();
-            match io::copy(&mut file, &mut hasher) {
-                Ok(_) => {
-                    let sha256: [u8; 32] = hasher.finalize().into();
-                    entries.insert(
-                        rel_str,
-                        SnapshotEntry::File {
-                            len: meta.len(),
-                            sha256,
-                            mode,
-                        },
-                    );
+            let store_backup = capture_backups
+                && usize::try_from(meta.len())
+                    .ok()
+                    .and_then(|len| snapshot.backup_bytes.checked_add(len))
+                    .is_some_and(|total| total <= MAX_BACKUP_BYTES);
+            if store_backup {
+                let mut bytes = Vec::with_capacity(meta.len() as usize);
+                match file.read_to_end(&mut bytes) {
+                    Ok(_) => {
+                        hasher.update(&bytes);
+                        let sha256: [u8; 32] = hasher.finalize().into();
+                        snapshot.backup_bytes += bytes.len();
+                        snapshot.backups.insert(rel_str.clone(), bytes);
+                        snapshot.entries.insert(
+                            rel_str,
+                            SnapshotEntry::File {
+                                len: meta.len(),
+                                sha256,
+                                mode,
+                            },
+                        );
+                    }
+                    Err(err)
+                        if cfg!(windows)
+                            && err.raw_os_error() == Some(33)
+                            && rel_str.starts_with(".storyflow/")
+                            && (rel_str.ends_with("/tasks.lock")
+                                || rel_str.ends_with("/run.lock")) =>
+                    {
+                        snapshot.entries.insert(
+                            rel_str,
+                            SnapshotEntry::LockedFile {
+                                len: meta.len(),
+                                mode,
+                            },
+                        );
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err)
-                    if cfg!(windows)
-                        && err.raw_os_error() == Some(33)
-                        && rel_str.starts_with(".storyflow/")
-                        && (rel_str.ends_with("/tasks.lock") || rel_str.ends_with("/run.lock")) =>
-                {
-                    entries.insert(
-                        rel_str,
-                        SnapshotEntry::LockedFile {
-                            len: meta.len(),
-                            mode,
-                        },
-                    );
+            } else {
+                match io::copy(&mut file, &mut hasher) {
+                    Ok(_) => {
+                        let sha256: [u8; 32] = hasher.finalize().into();
+                        snapshot.entries.insert(
+                            rel_str,
+                            SnapshotEntry::File {
+                                len: meta.len(),
+                                sha256,
+                                mode,
+                            },
+                        );
+                    }
+                    Err(err)
+                        if cfg!(windows)
+                            && err.raw_os_error() == Some(33)
+                            && rel_str.starts_with(".storyflow/")
+                            && (rel_str.ends_with("/tasks.lock")
+                                || rel_str.ends_with("/run.lock")) =>
+                    {
+                        snapshot.entries.insert(
+                            rel_str,
+                            SnapshotEntry::LockedFile {
+                                len: meta.len(),
+                                mode,
+                            },
+                        );
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
             }
         } else {
             return Err(io::Error::new(
@@ -937,17 +1005,19 @@ fn collect_snapshot(
     Ok(())
 }
 
-fn verify_workspace_changes(
-    before: &BTreeMap<String, SnapshotEntry>,
-    after: &BTreeMap<String, SnapshotEntry>,
+fn verify_and_restore_post_run(
+    root: &Path,
+    before: &WorkspaceSnapshot,
     policy: ExecutionPolicy,
     write_scope: &[String],
 ) -> Result<(), String> {
-    let all_paths: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    let after = snapshot_workspace(root, false)
+        .map_err(|err| format!("failed to verify codex workspace changes: {err}"))?;
+    let all_paths: BTreeSet<&String> = before.entries.keys().chain(after.entries.keys()).collect();
     let mut violations = Vec::new();
     for path in all_paths {
-        let prev = before.get(path);
-        let curr = after.get(path);
+        let prev = before.entries.get(path);
+        let curr = after.entries.get(path);
         if prev == curr {
             continue;
         }
@@ -969,16 +1039,207 @@ fn verify_workspace_changes(
         }
     }
     if violations.is_empty() {
-        Ok(())
-    } else {
-        let sample = violations
-            .into_iter()
-            .take(16)
-            .collect::<Vec<_>>()
-            .join(", ");
+        return Ok(());
+    }
+
+    let rollback_errors = restore_violations(root, &violations, before, &after);
+    let sample = violations
+        .into_iter()
+        .take(16)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if rollback_errors.is_empty() {
         Err(format!(
-            "codex modified paths outside allowed scope ({policy:?}): {sample}"
+            "codex modified paths outside allowed scope ({policy:?}; restored): {sample}"
         ))
+    } else {
+        let err_sample = rollback_errors
+            .into_iter()
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(format!(
+            "codex modified paths outside allowed scope ({policy:?}; rollback failed: {err_sample}): {sample}"
+        ))
+    }
+}
+
+fn restore_violations(
+    root: &Path,
+    violations: &[String],
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // 1. Remove added or type-changed non-directory entries first, then added directories deepest-first.
+    for path in violations.iter().rev() {
+        let prev = before.entries.get(path);
+        let curr = after.entries.get(path);
+        let full = root.join(path);
+        match (prev, curr) {
+            (None, Some(SnapshotEntry::File { .. } | SnapshotEntry::Symlink(_))) => {
+                if let Err(err) = remove_file_or_symlink(&full) {
+                    errors.push(format!("{path}: {err}"));
+                }
+            }
+            (
+                Some(SnapshotEntry::Dir { .. }),
+                Some(SnapshotEntry::File { .. } | SnapshotEntry::Symlink(_)),
+            )
+            | (
+                Some(SnapshotEntry::File { .. } | SnapshotEntry::Symlink(_)),
+                Some(SnapshotEntry::Dir { .. }),
+            ) => {
+                if let Err(err) = remove_entry_any(&full, curr) {
+                    errors.push(format!("{path}: {err}"));
+                }
+            }
+            (None, Some(SnapshotEntry::Dir { .. })) => {
+                if let Err(err) = remove_dir_if_present(&full) {
+                    errors.push(format!("{path}: {err}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 2. Recreate deleted/replaced directories shallowest-first and restore dir permissions.
+    for path in violations {
+        if let Some(SnapshotEntry::Dir { mode }) = before.entries.get(path) {
+            let full = root.join(path);
+            if let Err(err) = fs::create_dir_all(&full).and_then(|()| restore_mode(&full, *mode)) {
+                errors.push(format!("{path}: {err}"));
+            }
+        }
+    }
+
+    // 3. Restore modified/deleted files and symlinks.
+    for path in violations {
+        let full = root.join(path);
+        match before.entries.get(path) {
+            Some(SnapshotEntry::File { mode, .. }) => {
+                let Some(bytes) = before.backups.get(path) else {
+                    errors.push(format!("{path}: original file exceeded backup limit"));
+                    continue;
+                };
+                if let Some(parent) = full.parent()
+                    && let Err(err) = fs::create_dir_all(parent)
+                {
+                    errors.push(format!("{path}: {err}"));
+                    continue;
+                }
+                if let Err(err) = make_writable_if_exists(&full)
+                    .and_then(|()| fs::write(&full, bytes))
+                    .and_then(|()| restore_mode(&full, *mode))
+                {
+                    errors.push(format!("{path}: {err}"));
+                }
+            }
+            Some(SnapshotEntry::Symlink(target)) => {
+                #[cfg(unix)]
+                {
+                    if let Err(err) = remove_file_or_symlink(&full)
+                        .or_else(|e| {
+                            if e.kind() == io::ErrorKind::NotFound {
+                                Ok(())
+                            } else {
+                                Err(e)
+                            }
+                        })
+                        .and_then(|()| std::os::unix::fs::symlink(target, &full))
+                    {
+                        errors.push(format!("{path}: {err}"));
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = target;
+                    errors.push(format!("{path}: cannot restore symlink on non-Unix host"));
+                }
+            }
+            Some(SnapshotEntry::LockedFile { .. } | SnapshotEntry::Dir { .. }) | None => {}
+        }
+    }
+
+    errors
+}
+
+fn make_writable_if_exists(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = meta.permissions();
+                perms.set_mode(perms.mode() | 0o200);
+                fs::set_permissions(path, perms)
+            }
+            #[cfg(not(unix))]
+            {
+                let mut perms = meta.permissions();
+                if perms.readonly() {
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    perms.set_readonly(false);
+                    fs::set_permissions(path, perms)?;
+                }
+                Ok(())
+            }
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn remove_file_or_symlink(path: &Path) -> io::Result<()> {
+    make_writable_if_exists(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn remove_dir_if_present(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = meta.permissions();
+                perms.set_mode(perms.mode() | 0o700);
+                let _ = fs::set_permissions(path, perms);
+            }
+            fs::remove_dir_all(path)
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn remove_entry_any(path: &Path, entry: Option<&SnapshotEntry>) -> io::Result<()> {
+    match entry {
+        Some(SnapshotEntry::Dir { .. }) => remove_dir_if_present(path),
+        _ => remove_file_or_symlink(path),
+    }
+}
+
+fn restore_mode(path: &Path, mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(mode);
+        fs::set_permissions(path, perms)
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = fs::symlink_metadata(path)?;
+        let mut perms = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(mode != 0);
+        fs::set_permissions(path, perms)
     }
 }
 
