@@ -3714,6 +3714,133 @@ fn codex_adapter_includes_bounded_prerequisite_reports_in_prompt() {
 }
 
 #[test]
+fn codex_adapter_rejects_hard_linked_files_at_scope_boundaries() {
+    let fixture = Fixture::new();
+
+    // 1. Read-scope hard link to an out-of-scope file must fail closed before launching Codex.
+    let workdir_read = fixture.isolated_workdir("wt-hardlink-read");
+    fs::create_dir_all(workdir_read.join("secrets")).unwrap();
+    fs::write(workdir_read.join("secrets/token.txt"), "secret-body\n").unwrap();
+    fs::hard_link(
+        workdir_read.join("secrets/token.txt"),
+        workdir_read.join("app/alias.txt"),
+    )
+    .unwrap();
+
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 3), &clock);
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+
+    let read_runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        read_runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        read_runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let read_adapter =
+        CodexAdapter::with_runner(CodexAdapterConfig::default(), read_runner.clone());
+    let cancel = CancelToken::new();
+    let refused_read = run_task(
+        &mut journal,
+        &read_adapter,
+        "a",
+        "codex-host",
+        &workdir_read,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(refused_read.status, ReconcileStatus::HostUnavailable);
+    assert!(
+        refused_read.detail.contains("hard-linked"),
+        "{refused_read:?}"
+    );
+    assert!(read_runner.observed_exec_paths().is_empty());
+
+    // 2. Write-scope hard link in destination workdir must fail closed before promoting writes.
+    let fixture_write = Fixture::new();
+    let workdir_write = fixture_write.isolated_workdir("wt-hardlink-write");
+    fs::write(workdir_write.join("app/input.txt"), "allowed input\n").unwrap();
+    fs::create_dir_all(workdir_write.join("secrets")).unwrap();
+    fs::write(workdir_write.join("secrets/token.txt"), "secret-body\n").unwrap();
+    fs::hard_link(
+        workdir_write.join("secrets/token.txt"),
+        workdir_write.join("app/a.txt"),
+    )
+    .unwrap();
+
+    let mut write_spec = spec("a", &[]);
+    write_spec.read_scope = vec!["app/input.txt".into()];
+    write_spec.write_scope = vec!["app/a.txt".into()];
+    let write_graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: "1".repeat(40),
+        story_revision: 0,
+        stage: TaskStage::Plan,
+        tasks: vec![write_spec],
+    };
+    let mut write_journal =
+        TaskJournal::open(&fixture_write.root, fixture_write.context.clone()).unwrap();
+    write_journal.initialize(write_graph).unwrap();
+    write_journal
+        .configure_scheduler(write_journal.view().revision.unwrap(), policy(1, 3), &clock)
+        .unwrap();
+
+    let write_runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        write_runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        write_runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let trev_w = task_rev(&write_journal, "a");
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": trev_w + 1,
+        "status": "succeeded",
+        "report": "attempted overwrite of hard-linked target",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    write_runner.set_workspace_mutation("app/a.txt", "overwritten\n");
+    write_runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let write_adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), write_runner);
+    let refused_write = run_task(
+        &mut write_journal,
+        &write_adapter,
+        "a",
+        "codex-host",
+        &workdir_write,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(refused_write.status, ReconcileStatus::Blocked);
+    assert_eq!(refused_write.code, "invalid_output");
+    assert!(
+        refused_write.detail.contains("hard-linked"),
+        "{refused_write:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(workdir_write.join("secrets/token.txt")).unwrap(),
+        "secret-body\n",
+        "hard-linked out-of-scope alias must remain untouched"
+    );
+}
+
+#[test]
 #[ignore]
 fn codex_live_smoke() {
     let fixture = Fixture::new();

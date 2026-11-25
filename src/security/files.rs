@@ -28,6 +28,25 @@ fn parts(relative: &str) -> io::Result<Vec<&str>> {
     Ok(relative.split('/').collect())
 }
 
+pub(crate) fn file_link_count(path: &Path, meta: &std::fs::Metadata) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        Ok(meta.nlink())
+    }
+    #[cfg(windows)]
+    {
+        let _ = meta;
+        platform::file_link_count(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, meta);
+        Ok(1)
+    }
+}
+
 pub fn read(root: &Path, relative: &str, limit: usize) -> io::Result<Vec<u8>> {
     let parts = parts(relative)?;
     let mut file = platform::open(root, &parts, false)?;
@@ -348,6 +367,15 @@ mod platform {
         }
         Ok(())
     }
+    pub(super) fn file_link_count(path: &Path) -> io::Result<u64> {
+        let file = File::open(path)?;
+        let mut info: Information = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(u64::from(info.links))
+    }
+
     pub(super) fn open(root: &Path, parts: &[&str], write: bool) -> io::Result<File> {
         if !root.is_absolute() {
             return Err(denied());

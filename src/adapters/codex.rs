@@ -1250,6 +1250,15 @@ fn stage_dir_entries(
             if !in_read {
                 continue;
             }
+            match file_link_count(&path, &meta) {
+                Ok(n) if n > 1 => {
+                    return Err(StageError::SymlinkOrSpecial(format!(
+                        "refusing hard-linked file in codex read_scope: {rel_str}"
+                    )));
+                }
+                Ok(_) => {}
+                Err(err) => return Err(StageError::Io(err.to_string())),
+            }
             let next_bytes = usize::try_from(meta.len())
                 .ok()
                 .and_then(|len| copied_bytes.checked_add(len))
@@ -1305,11 +1314,22 @@ enum WorkdirBackupEntry {
     File { bytes: Vec<u8>, mode: u32 },
 }
 
+use crate::security::file_link_count;
+
 fn read_bounded_file(path: &Path, limit: usize, context: &str) -> Result<Vec<u8>, String> {
     let meta =
         fs::symlink_metadata(path).map_err(|err| format!("failed to inspect {context}: {err}"))?;
     if !meta.file_type().is_file() {
         return Err(format!("refusing non-regular file for {context}"));
+    }
+    match file_link_count(path, &meta) {
+        Ok(n) if n > 1 => {
+            return Err(format!("refusing hard-linked file for {context}"));
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return Err(format!("failed to verify link count for {context}: {err}"));
+        }
     }
     if meta.len() > limit as u64 {
         return Err(format!("{context} exceeds backup size limit"));
@@ -2190,6 +2210,19 @@ fn capture_workdir_backups(
                 Ok(())
             }
             Ok(meta) if meta.file_type().is_file() => {
+                match file_link_count(&target, &meta) {
+                    Ok(n) if n > 1 => {
+                        return Err(format!(
+                            "refusing staged promotion over hard-linked file in workdir: {rel}"
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        return Err(format!(
+                            "failed to verify link count for {rel} in workdir before promotion: {err}"
+                        ));
+                    }
+                }
                 let remaining = max_backup_bytes.saturating_sub(backup_bytes);
                 let bytes = read_bounded_file(
                     &target,
@@ -2316,9 +2349,7 @@ fn apply_write_ops(
                 fs::create_dir_all(parent)
                     .map_err(|err| format!("failed to create parent directory for {rel}: {err}"))?;
             }
-            make_writable_if_exists(&target)
-                .and_then(|()| fs::write(&target, bytes))
-                .and_then(|()| restore_mode(&target, *mode))
+            replace_regular_file(&target, bytes, *mode)
                 .map_err(|err| format!("failed to write staged file {rel}: {err}"))?;
         }
     }
@@ -2330,6 +2361,31 @@ fn apply_write_ops(
         }
     }
     Ok(())
+}
+
+fn replace_regular_file(target: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    match fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing in-place or symlink replacement at promotion target",
+            ));
+        }
+        Ok(meta) if meta.file_type().is_file() => {
+            make_writable_if_exists(target)?;
+            fs::remove_file(target)?;
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing replacement over non-regular file target",
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    write_exclusive_file(target, bytes)?;
+    restore_mode(target, mode)
 }
 
 fn rollback_workdir_promotion(
@@ -2369,7 +2425,7 @@ fn rollback_workdir_promotion(
             }
         }
     }
-    // 4. Restore backed-up files and their permissions.
+    // 4. Restore backed-up files and their permissions without mutating existing inodes in place.
     for (rel, entry) in backups {
         if let WorkdirBackupEntry::File { bytes, mode } = entry {
             let target = workdir.join(rel);
@@ -2380,10 +2436,7 @@ fn rollback_workdir_promotion(
                 errors.push(format!("{rel}: {err}"));
                 continue;
             }
-            if let Err(err) = make_writable_if_exists(&target)
-                .and_then(|()| fs::write(&target, bytes))
-                .and_then(|()| restore_mode(&target, *mode))
-            {
+            if let Err(err) = replace_regular_file(&target, bytes, *mode) {
                 errors.push(format!("{rel}: {err}"));
             }
         }
