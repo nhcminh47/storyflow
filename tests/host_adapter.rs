@@ -2455,17 +2455,30 @@ fn codex_adapter_confines_reads_via_config_in_git_worktree() {
         "legacy --sandbox flag must be omitted when activating default_permissions profile: {:?}",
         exec_call.args
     );
-    assert!(
-        exec_call
-            .args
-            .windows(2)
-            .any(|w| { w[0] == "--config" && w[1] == "default_permissions=\"storyflow_scoped\"" }),
-        "{:?}",
-        exec_call.args
-    );
+    let profile_kv = exec_call
+        .args
+        .windows(2)
+        .find_map(|w| {
+            if w[0] == "--config" && w[1].starts_with("default_permissions=\"storyflow_scoped_") {
+                Some(w[1].clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing invocation-unique default_permissions in {:?}",
+                exec_call.args
+            )
+        });
+    let profile_name = profile_kv
+        .strip_prefix("default_permissions=\"")
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap();
     assert!(
         exec_call.args.windows(2).any(|w| {
-            w[0] == "--config" && w[1] == "permissions.storyflow_scoped.network.enabled=false"
+            w[0] == "--config"
+                && w[1] == format!("permissions.{profile_name}.network.enabled=false")
         }),
         "{:?}",
         exec_call.args
@@ -2473,7 +2486,7 @@ fn codex_adapter_confines_reads_via_config_in_git_worktree() {
     assert!(
         exec_call.args.windows(2).any(|w| {
             w[0] == "--config"
-                && w[1] == "permissions.storyflow_scoped.filesystem.\":root\"=\"deny\""
+                && w[1] == format!("permissions.{profile_name}.filesystem.\":root\"=\"deny\"")
         }),
         "{:?}",
         exec_call.args
@@ -2484,7 +2497,7 @@ fn codex_adapter_confines_reads_via_config_in_git_worktree() {
         .into_owned();
     let git_dir_trimmed = git_dir_norm.strip_prefix(r"\\?\").unwrap_or(&git_dir_norm);
     let expected_git_deny = format!(
-        "permissions.storyflow_scoped.filesystem.{}=\"deny\"",
+        "permissions.{profile_name}.filesystem.{}=\"deny\"",
         serde_json::to_string(git_dir_trimmed).unwrap()
     );
     assert!(
@@ -2495,6 +2508,139 @@ fn codex_adapter_confines_reads_via_config_in_git_worktree() {
         "expected {expected_git_deny} in {:?}",
         exec_call.args
     );
+}
+
+#[test]
+fn codex_adapter_rejects_stale_git_worktree_base_before_promotion() {
+    fn run_git(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new(git_executable())
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    let fixture = Fixture::new();
+    let repo_root = fixture.root.join("git-stale-base");
+    fs::create_dir_all(repo_root.join("app")).unwrap();
+    fs::write(repo_root.join(".gitignore"), ".storyflow/\n").unwrap();
+    fs::write(repo_root.join("app/seed.txt"), "seed\n").unwrap();
+
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.name", "test"]);
+    run_git(&repo_root, &["config", "user.email", "test@local"]);
+    run_git(&repo_root, &["add", ".gitignore", "app/seed.txt"]);
+    run_git(&repo_root, &["commit", "-m", "commit 1"]);
+    let stale_head = run_git(&repo_root, &["rev-parse", "HEAD"]);
+
+    fs::write(repo_root.join("app/seed.txt"), "seed v2\n").unwrap();
+    run_git(&repo_root, &["add", "app/seed.txt"]);
+    run_git(&repo_root, &["commit", "-m", "commit 2 (expected base)"]);
+    let expected_base = run_git(&repo_root, &["rev-parse", "HEAD"]);
+
+    fs::create_dir_all(repo_root.join(format!(".storyflow/{STORY}/events"))).unwrap();
+    let context = RunContext {
+        story: STORY.into(),
+        base: expected_base.clone(),
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        blocked: false,
+        scope: vec!["app".into()],
+        protected: Vec::new(),
+    };
+    let mut impl_spec = spec("a", &[]);
+    impl_spec.stage = TaskStage::Implement;
+    let graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: expected_base,
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        tasks: vec![impl_spec],
+    };
+
+    let mut journal = TaskJournal::open(&repo_root, context).unwrap();
+    journal.initialize(graph).unwrap();
+    let clock = FakeClock::at(100);
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(1, 2), &clock)
+        .unwrap();
+    let dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+
+    // Provision a stale worktree pointing at commit 1 instead of expected_base (commit 2).
+    let stale_wt = repo_root.join("worktree-stale");
+    run_git(
+        &repo_root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            stale_wt.to_str().unwrap(),
+            &stale_head,
+        ],
+    );
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    runner.push_ok(0, sandbox_help, "", false, false);
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": dispatch.packet.task.revision,
+        "status": "succeeded",
+        "report": "wrote on stale base",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("app/a.txt", "should not promote on stale base\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let req = AdapterRequest {
+        schema: ADAPTER_SCHEMA,
+        dispatch: dispatch.clone(),
+        workdir: stale_wt.clone(),
+        timeout_ms: 10_000,
+        policy: ExecutionPolicy::WorkspaceWrite,
+    };
+    let outcome = adapter.execute(&req, &cancel);
+    let report = reconcile_outcome(&mut journal, &dispatch, outcome, &clock).unwrap();
+    assert_eq!(report.status, ReconcileStatus::Blocked);
+    assert_eq!(report.code, "invalid_output");
+    assert!(
+        report.detail.contains("does not match expected task base"),
+        "{}",
+        report.detail
+    );
+    assert!(!stale_wt.join("app/a.txt").exists());
+    assert_eq!(run_git(&stale_wt, &["rev-parse", "HEAD"]), stale_head);
 }
 
 #[test]

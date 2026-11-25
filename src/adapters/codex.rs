@@ -535,6 +535,20 @@ impl HostAdapter for CodexAdapter {
 
         let schema_path = temp_dir.path().join("result-schema.json");
         let output_path = temp_dir.path().join("last-message.json");
+        let staged_codex_cfg = staging_dir.path().join(".codex").join("config.toml");
+        if use_config_confinement
+            && match fs::read_to_string(&staged_codex_cfg) {
+                Ok(text) => config_toml_sets_legacy_sandbox(&text),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            }
+        {
+            return AdapterOutcome::HostUnavailable {
+                provider: "codex".to_owned(),
+                detail: "staged .codex/config.toml sets legacy sandbox or colliding profile keys"
+                    .to_owned(),
+            };
+        }
         if caps.supports_output_schema
             && let Err(err) = write_exclusive_file(&schema_path, output_schema_json().as_bytes())
         {
@@ -546,6 +560,7 @@ impl HostAdapter for CodexAdapter {
             };
         }
 
+        let profile_name = scoped_profile_name(&request.dispatch.lease.attempt_id);
         let mut args = vec!["exec".to_owned()];
         if caps.supports_working_dir {
             args.push("--cd".to_owned());
@@ -554,6 +569,7 @@ impl HostAdapter for CodexAdapter {
         if use_config_confinement {
             append_config_read_confinement(
                 &mut args,
+                &profile_name,
                 staging_dir.path(),
                 &request.workdir,
                 request.policy,
@@ -746,6 +762,18 @@ impl HostAdapter for CodexAdapter {
             && request.policy == ExecutionPolicy::WorkspaceWrite
             && result.status == ResultStatus::Succeeded
         {
+            let has_git = workdir_is_git_worktree(&request.workdir);
+            if has_git
+                && let Err(detail) =
+                    verify_git_worktree_base(&request.workdir, &request.dispatch.packet)
+            {
+                return AdapterOutcome::InvalidOutput {
+                    correlation,
+                    worker_stopped,
+                    detail: sanitize_reason(&detail),
+                };
+            }
+
             let promoted = match apply_staged_writes(
                 staging_dir.path(),
                 &request.workdir,
@@ -763,7 +791,6 @@ impl HostAdapter for CodexAdapter {
                 }
             };
 
-            let has_git = workdir_is_git_worktree(&request.workdir);
             if has_git {
                 if promoted.paths.is_empty() {
                     let _ = rollback_workdir_promotion(&request.workdir, &promoted.backups);
@@ -1419,31 +1446,252 @@ fn ambient_codex_config_paths() -> Vec<PathBuf> {
 }
 
 fn config_toml_sets_legacy_sandbox(text: &str) -> bool {
+    parse_toml_checks(text).unwrap_or(true)
+}
+
+fn parse_toml_checks(text: &str) -> Result<bool, ()> {
+    let mut current_table: Vec<String> = Vec::new();
     for raw_line in text.lines() {
-        let code = raw_line.split('#').next().unwrap_or("").trim();
+        let line_no_comment = strip_toml_comment(raw_line)?;
+        let code = line_no_comment.trim();
         if code.is_empty() {
             continue;
         }
-        if let Some(table) = code.strip_prefix('[') {
-            let section = table.trim_end_matches(']').trim();
-            if section == "sandbox_workspace_write"
-                || section.starts_with("sandbox_workspace_write.")
-            {
-                return true;
+        if code.starts_with('[') {
+            let (inner, rest) = if let Some(after_dbl) = code.strip_prefix("[[") {
+                let end = after_dbl.rfind("]]").ok_or(())?;
+                (&after_dbl[..end], after_dbl[end + 2..].trim())
+            } else {
+                let after_sgl = code.strip_prefix('[').ok_or(())?;
+                let end = after_sgl.rfind(']').ok_or(())?;
+                (&after_sgl[..end], after_sgl[end + 1..].trim())
+            };
+            if !rest.is_empty() {
+                return Err(());
             }
+            let table_path = parse_toml_key_path(inner)?;
+            if is_restricted_toml_path(&table_path) {
+                return Ok(true);
+            }
+            current_table = table_path;
             continue;
         }
-        if let Some((key, _)) = code.split_once('=') {
-            let key = key.trim();
-            if key == "sandbox_mode"
-                || key == "sandbox_workspace_write"
-                || key.starts_with("sandbox_workspace_write.")
-            {
-                return true;
-            }
+        let Some((lhs, rhs)) = split_toml_assignment(code) else {
+            return Err(());
+        };
+        let key_segments = parse_toml_key_path(lhs)?;
+        let rhs_trimmed = rhs.trim();
+        if rhs_trimmed.is_empty()
+            || rhs_trimmed.contains("\"\"\"")
+            || rhs_trimmed.contains("'''")
+            || !toml_value_brackets_balanced(rhs_trimmed)?
+        {
+            return Err(());
+        }
+        let mut full_path = current_table.clone();
+        full_path.extend(key_segments);
+        if is_restricted_toml_path(&full_path) {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
+}
+
+fn is_restricted_toml_path(segments: &[String]) -> bool {
+    let Some(first) = segments.first().map(String::as_str) else {
+        return false;
+    };
+    first == "sandbox_mode"
+        || first == "sandbox_workspace_write"
+        || (first == "permissions"
+            && segments
+                .get(1)
+                .is_some_and(|p| p.starts_with("storyflow_scoped")))
+}
+
+fn strip_toml_comment(line: &str) -> Result<&str, ()> {
+    if line.contains("\"\"\"") || line.contains("'''") {
+        return Err(());
+    }
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+        } else if in_double {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+            i += 1;
+        } else if b == b'\'' {
+            in_single = true;
+            i += 1;
+        } else if b == b'"' {
+            in_double = true;
+            i += 1;
+        } else if b == b'#' {
+            return Ok(&line[..i]);
+        } else {
+            i += 1;
+        }
+    }
+    if in_single || in_double {
+        return Err(());
+    }
+    Ok(line)
+}
+
+fn split_toml_assignment(code: &str) -> Option<(&str, &str)> {
+    let bytes = code.as_bytes();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+        } else if b == b'\'' {
+            in_single = true;
+        } else if b == b'"' {
+            in_double = true;
+        } else if b == b'=' {
+            return Some((&code[..i], &code[i + 1..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn toml_value_brackets_balanced(rhs: &str) -> Result<bool, ()> {
+    let bytes = rhs.as_bytes();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut depth: i32 = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if b == b'\\' {
+                if i + 1 >= bytes.len() {
+                    return Err(());
+                }
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+        } else if b == b'\'' {
+            in_single = true;
+        } else if b == b'"' {
+            in_double = true;
+        } else if b == b'[' || b == b'{' {
+            depth += 1;
+        } else if b == b']' || b == b'}' {
+            depth -= 1;
+            if depth < 0 {
+                return Err(());
+            }
+        }
+        i += 1;
+    }
+    if in_single || in_double {
+        return Err(());
+    }
+    Ok(depth == 0)
+}
+
+fn parse_toml_key_path(raw: &str) -> Result<Vec<String>, ()> {
+    let mut segments = Vec::new();
+    let mut rest = raw.trim();
+    if rest.is_empty() {
+        return Err(());
+    }
+    loop {
+        rest = rest.trim_start();
+        let (seg, after) = if let Some(s) = rest.strip_prefix('\'') {
+            let end = s.find('\'').ok_or(())?;
+            (s[..end].to_owned(), &s[end + 1..])
+        } else if let Some(s) = rest.strip_prefix('"') {
+            let mut out = String::new();
+            let mut chars = s.char_indices();
+            let mut end_idx = None;
+            while let Some((idx, ch)) = chars.next() {
+                if ch == '"' {
+                    end_idx = Some(idx);
+                    break;
+                }
+                if ch == '\\' {
+                    let (_, esc) = chars.next().ok_or(())?;
+                    match esc {
+                        '\\' => out.push('\\'),
+                        '"' => out.push('"'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        _ => return Err(()),
+                    }
+                } else {
+                    out.push(ch);
+                }
+            }
+            let end = end_idx.ok_or(())?;
+            (out, &s[end + 1..])
+        } else {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return Err(());
+            }
+            (rest[..end].to_owned(), &rest[end..])
+        };
+        segments.push(seg);
+        let next = after.trim_start();
+        if next.is_empty() {
+            break;
+        }
+        rest = next.strip_prefix('.').ok_or(())?;
+    }
+    Ok(segments)
+}
+
+fn scoped_profile_name(attempt_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(attempt_id.as_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(TEMP_COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    let digest = hasher.finalize();
+    let mut suffix = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut suffix, "{byte:02x}");
+    }
+    format!("storyflow_scoped_{suffix}")
 }
 
 fn supports_config_read_confinement(caps: &HostCapabilities) -> bool {
@@ -1452,6 +1700,7 @@ fn supports_config_read_confinement(caps: &HostCapabilities) -> bool {
 
 fn append_config_read_confinement(
     args: &mut Vec<String>,
+    profile_name: &str,
     staging_dir: &Path,
     workdir: &Path,
     policy: ExecutionPolicy,
@@ -1460,10 +1709,14 @@ fn append_config_read_confinement(
         args.push("--config".to_owned());
         args.push(kv);
     };
-    push_cfg("default_permissions=\"storyflow_scoped\"".to_owned());
-    push_cfg("permissions.storyflow_scoped.network.enabled=false".to_owned());
-    push_cfg("permissions.storyflow_scoped.filesystem.\":root\"=\"deny\"".to_owned());
-    push_cfg("permissions.storyflow_scoped.filesystem.\":minimal\"=\"read\"".to_owned());
+    push_cfg(format!("default_permissions=\"{profile_name}\""));
+    push_cfg(format!("permissions.{profile_name}.network.enabled=false"));
+    push_cfg(format!(
+        "permissions.{profile_name}.filesystem.\":root\"=\"deny\""
+    ));
+    push_cfg(format!(
+        "permissions.{profile_name}.filesystem.\":minimal\"=\"read\""
+    ));
 
     let staging_policy = normalize_policy_path(staging_dir);
     let workdir_policy = normalize_policy_path(workdir);
@@ -1473,12 +1726,12 @@ fn append_config_read_confinement(
     };
     if let Ok(quoted_staging) = serde_json::to_string(&staging_policy) {
         push_cfg(format!(
-            "permissions.storyflow_scoped.filesystem.{quoted_staging}=\"{staging_mode}\""
+            "permissions.{profile_name}.filesystem.{quoted_staging}=\"{staging_mode}\""
         ));
     }
     if let Ok(quoted_workdir) = serde_json::to_string(&workdir_policy) {
         push_cfg(format!(
-            "permissions.storyflow_scoped.filesystem.{quoted_workdir}=\"deny\""
+            "permissions.{profile_name}.filesystem.{quoted_workdir}=\"deny\""
         ));
     }
     if workdir_is_git_worktree(workdir)
@@ -1498,10 +1751,83 @@ fn append_config_read_confinement(
             && let Ok(quoted_common) = serde_json::to_string(&common_policy)
         {
             push_cfg(format!(
-                "permissions.storyflow_scoped.filesystem.{quoted_common}=\"deny\""
+                "permissions.{profile_name}.filesystem.{quoted_common}=\"deny\""
             ));
         }
     }
+}
+
+fn verify_git_worktree_base(
+    workdir: &Path,
+    packet: &crate::tasks::TaskPacket,
+) -> Result<String, String> {
+    let dirty = run_git_checked(workdir, &["status".to_owned(), "--porcelain".to_owned()])?;
+    if !dirty.trim().is_empty() {
+        return Err(
+            "git worktree has uncommitted changes before promoting staged writes".to_owned(),
+        );
+    }
+    let head = run_git_checked(
+        workdir,
+        &[
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            "HEAD".to_owned(),
+        ],
+    )?;
+    let story_base = run_git_checked(
+        workdir,
+        &[
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            format!("{}^{{commit}}", packet.base),
+        ],
+    )?;
+    if packet.prerequisites.is_empty() {
+        if head != story_base {
+            return Err(format!(
+                "git worktree HEAD ({head}) does not match expected task base ({story_base})"
+            ));
+        }
+        return Ok(head);
+    }
+    run_git_checked(
+        workdir,
+        &[
+            "merge-base".to_owned(),
+            "--is-ancestor".to_owned(),
+            story_base,
+            "HEAD".to_owned(),
+        ],
+    )
+    .map_err(|_| "git worktree HEAD does not descend from pinned story base commit".to_owned())?;
+    for (dep_id, dep_res) in &packet.prerequisites {
+        if let Some(dep_commit) = &dep_res.commit {
+            let resolved_dep = run_git_checked(
+                workdir,
+                &[
+                    "rev-parse".to_owned(),
+                    "--verify".to_owned(),
+                    format!("{dep_commit}^{{commit}}"),
+                ],
+            )?;
+            run_git_checked(
+                workdir,
+                &[
+                    "merge-base".to_owned(),
+                    "--is-ancestor".to_owned(),
+                    resolved_dep,
+                    "HEAD".to_owned(),
+                ],
+            )
+            .map_err(|_| {
+                format!(
+                    "git worktree HEAD is stale relative to prerequisite {dep_id} commit {dep_commit}"
+                )
+            })?;
+        }
+    }
+    Ok(head)
 }
 
 fn normalize_policy_path(path: &Path) -> String {
@@ -2660,16 +2986,32 @@ mod tests {
     #[test]
     fn config_toml_detects_legacy_sandbox_keys() {
         assert!(!config_toml_sets_legacy_sandbox(
-            "# sandbox_mode = \"workspace-write\"\ndefault_permissions = \":workspace\"\n"
+            "# sandbox_mode = \"workspace-write\"\ndefault_permissions = \":workspace\"\n[permissions.other]\n\":minimal\" = \"read\"\n"
         ));
         assert!(config_toml_sets_legacy_sandbox(
             "model = \"gpt-5\"\nsandbox_mode = \"workspace-write\"\n"
+        ));
+        assert!(config_toml_sets_legacy_sandbox(
+            "'sandbox_mode' = 'workspace-write'\n"
+        ));
+        assert!(config_toml_sets_legacy_sandbox(
+            "\"sandbox_mode\" = \"read-only\"\n"
         ));
         assert!(config_toml_sets_legacy_sandbox(
             "[sandbox_workspace_write]\nnetwork_access = false\n"
         ));
         assert!(config_toml_sets_legacy_sandbox(
             "sandbox_workspace_write.writable_roots = [\"/tmp\"]\n"
+        ));
+        assert!(config_toml_sets_legacy_sandbox(
+            "[permissions.storyflow_scoped]\n\":root\" = \"read\"\n"
+        ));
+        assert!(config_toml_sets_legacy_sandbox(
+            "[permissions.'storyflow_scoped_abc']\n\"/\" = \"read\"\n"
+        ));
+        assert!(config_toml_sets_legacy_sandbox("\"\"\"multiline\"\"\"\n"));
+        assert!(config_toml_sets_legacy_sandbox(
+            "unrecognized syntax here\n"
         ));
     }
 }
