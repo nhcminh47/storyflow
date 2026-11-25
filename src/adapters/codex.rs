@@ -346,6 +346,7 @@ impl HostAdapter for CodexAdapter {
             version,
             &help_text,
             self.runner.has_unbroken_containment(),
+            self.runner.has_read_root_confinement(),
         )
     }
 
@@ -409,31 +410,10 @@ impl HostAdapter for CodexAdapter {
         }
 
         if !self.runner.has_read_root_confinement() && !use_config_confinement {
-            match find_unscoped_workdir_entries(
-                &request.workdir,
-                &request.dispatch.packet.task.spec.read_scope,
-            ) {
-                Ok(unscoped) if !unscoped.is_empty() => {
-                    return AdapterOutcome::HostUnavailable {
-                        provider: "codex".to_owned(),
-                        detail: sanitize_reason(&format!(
-                            "codex --sandbox does not restrict filesystem reads and cannot isolate unscoped or protected paths in workdir: {}",
-                            unscoped.join(", ")
-                        )),
-                    };
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    return AdapterOutcome::HostCrashed {
-                        correlation: fallback_correlation,
-                        worker_stopped: true,
-                        exit_code: None,
-                        detail: sanitize_reason(&format!(
-                            "failed to verify codex read_scope isolation in workdir: {err}"
-                        )),
-                    };
-                }
-            }
+            return AdapterOutcome::HostUnavailable {
+                provider: "codex".to_owned(),
+                detail: "codex host cannot enforce read-root confinement: runner lacks external read-root confinement and installed codex exec does not advertise '--config'".to_owned(),
+            };
         }
 
         let prompt = match build_prompt(request) {
@@ -868,6 +848,7 @@ fn parse_exec_help(
     version: Option<String>,
     help_text: &str,
     supports_cancel: bool,
+    runner_has_read_root_confinement: bool,
 ) -> HostCapabilities {
     let mut detected = BTreeSet::new();
     for token in help_text.split(|c: char| {
@@ -883,6 +864,8 @@ fn parse_exec_help(
     let supports_output_file = detected.contains("--output-last-message");
     let supports_working_dir = detected.contains("--cd");
     let supports_sandbox_flag = detected.contains("--sandbox");
+    let has_read_root_confinement =
+        runner_has_read_root_confinement || detected.contains("--config");
     let supports_stdin_prompt = help_text.lines().any(|line| {
         let lower = line.to_ascii_lowercase();
         lower.contains("stdin")
@@ -892,7 +875,7 @@ fn parse_exec_help(
     HostCapabilities {
         schema: ADAPTER_SCHEMA,
         provider: "codex".to_owned(),
-        available: supports_sandbox_flag,
+        available: supports_sandbox_flag && has_read_root_confinement,
         version,
         executable: Some(exe.to_owned()),
         supports_json_output,
@@ -904,13 +887,18 @@ fn parse_exec_help(
         supports_session_id: supports_json_output,
         supports_stdin_prompt,
         detected_flags: detected.into_iter().collect(),
-        unavailable_reason: if supports_sandbox_flag {
-            None
-        } else {
+        unavailable_reason: if !supports_sandbox_flag {
             Some(
                 "installed codex host does not advertise '--sandbox' required to enforce execution policy"
                     .to_owned(),
             )
+        } else if !has_read_root_confinement {
+            Some(
+                "installed codex host does not advertise '--config' and runner lacks external read-root confinement"
+                    .to_owned(),
+            )
+        } else {
+            None
         },
     }
 }
@@ -1215,53 +1203,6 @@ fn stage_dir_entries(
             return Err(StageError::SymlinkOrSpecial(format!(
                 "unsupported special file in codex read_scope: {rel_str}"
             )));
-        }
-    }
-    Ok(())
-}
-
-fn find_unscoped_workdir_entries(workdir: &Path, read_scope: &[String]) -> io::Result<Vec<String>> {
-    let mut unscoped = Vec::new();
-    collect_unscoped_entries(workdir, workdir, read_scope, &mut unscoped)?;
-    Ok(unscoped)
-}
-
-fn collect_unscoped_entries(
-    workdir: &Path,
-    dir: &Path,
-    read_scope: &[String],
-    unscoped: &mut Vec<String>,
-) -> io::Result<()> {
-    const MAX_SAMPLE: usize = 16;
-    let mut children: Vec<_> = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
-    children.sort_by_key(|entry| entry.file_name());
-    for child in children {
-        if unscoped.len() >= MAX_SAMPLE {
-            break;
-        }
-        let path = child.path();
-        let rel = path
-            .strip_prefix(workdir)
-            .map_err(|_| io::Error::other("workspace path escaped root"))?;
-        let rel_str = rel_path_utf8(rel)?;
-        if rel_str.is_empty() {
-            continue;
-        }
-        if is_protected_path(&rel_str) {
-            unscoped.push(rel_str);
-            continue;
-        }
-        let in_read = read_scope.iter().any(|scope| within_path(&rel_str, scope));
-        let is_ancestor = read_scope.iter().any(|scope| within_path(scope, &rel_str));
-        let meta = fs::symlink_metadata(&path)?;
-        if meta.file_type().is_dir() {
-            if in_read || is_ancestor {
-                collect_unscoped_entries(workdir, &path, read_scope, unscoped)?;
-            } else {
-                unscoped.push(rel_str);
-            }
-        } else if !in_read {
-            unscoped.push(rel_str);
         }
     }
     Ok(())
@@ -1752,7 +1693,12 @@ fn verify_git_worktree_base(
     workdir: &Path,
     packet: &crate::tasks::TaskPacket,
 ) -> Result<String, String> {
-    let dirty = run_git_checked(workdir, &["status".to_owned(), "--porcelain".to_owned()])?;
+    let filter_args = disabled_git_filter_args(workdir)?;
+    let dirty = run_git_no_filters(
+        workdir,
+        &filter_args,
+        &["status".to_owned(), "--porcelain".to_owned()],
+    )?;
     if !dirty.trim().is_empty() {
         return Err(
             "git worktree has uncommitted changes before promoting staged writes".to_owned(),
@@ -1855,10 +1801,17 @@ fn workdir_is_git_worktree(workdir: &Path) -> bool {
 
 fn run_git_checked(workdir: &Path, args: &[String]) -> Result<String, String> {
     let program = git_executable().to_string_lossy().into_owned();
+    let mut isolated_args = vec![
+        "-c".to_owned(),
+        "core.fsmonitor=false".to_owned(),
+        "-c".to_owned(),
+        "diff.external=".to_owned(),
+    ];
+    isolated_args.extend(args.iter().cloned());
     let res = run_process(
         &CommandSpec {
             program,
-            args: args.to_vec(),
+            args: isolated_args,
             timeout: Duration::from_secs(30),
         },
         workdir,
@@ -1876,6 +1829,68 @@ fn run_git_checked(workdir: &Path, args: &[String]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&res.stdout).trim().to_owned())
 }
 
+fn disabled_git_filter_args(workdir: &Path) -> Result<Vec<String>, String> {
+    let program = git_executable().to_string_lossy().into_owned();
+    let res = run_process(
+        &CommandSpec {
+            program,
+            args: vec![
+                "-c".to_owned(),
+                "core.fsmonitor=false".to_owned(),
+                "config".to_owned(),
+                "--name-only".to_owned(),
+                "--get-regexp".to_owned(),
+                r"^filter\..*\.(clean|process|smudge|required)$".to_owned(),
+            ],
+            timeout: Duration::from_secs(30),
+        },
+        workdir,
+    )
+    .map_err(|err| format!("git config filter probe failed: {err}"))?;
+    if res.timed_out {
+        return Err("git config probe timed out while checking filter settings".to_owned());
+    }
+    match res.status.and_then(|s| s.code()) {
+        Some(1) => Ok(Vec::new()),
+        Some(0) => {
+            let mut keys = BTreeSet::new();
+            for line in String::from_utf8_lossy(&res.stdout).lines() {
+                let key = line.trim();
+                if !key.is_empty() {
+                    keys.insert(key.to_owned());
+                }
+            }
+            let mut out = Vec::with_capacity(keys.len() * 2);
+            for key in keys {
+                out.push("-c".to_owned());
+                if key.ends_with(".required") {
+                    out.push(format!("{key}=false"));
+                } else {
+                    out.push(format!("{key}="));
+                }
+            }
+            Ok(out)
+        }
+        other => {
+            let stderr = String::from_utf8_lossy(&res.stderr).trim().to_owned();
+            Err(format!(
+                "git config filter probe failed with exit code {other:?}: {stderr}"
+            ))
+        }
+    }
+}
+
+fn run_git_no_filters(
+    workdir: &Path,
+    filter_args: &[String],
+    args: &[String],
+) -> Result<String, String> {
+    let mut combined = Vec::with_capacity(filter_args.len() + args.len());
+    combined.extend(filter_args.iter().cloned());
+    combined.extend(args.iter().cloned());
+    run_git_checked(workdir, &combined)
+}
+
 fn commit_promoted_writes(
     workdir: &Path,
     promoted_paths: &[String],
@@ -1891,22 +1906,101 @@ fn commit_promoted_writes(
             "HEAD".to_owned(),
         ],
     )?;
+    let filter_args = disabled_git_filter_args(workdir)?;
     let hooks_dir = TempArtifactsDir::new()
         .map_err(|err| format!("failed to allocate empty git hooks dir: {err}"))?;
     let hooks_arg = format!("core.hooksPath={}", hooks_dir.path().display());
 
-    let mut add_args = vec!["add".to_owned(), "-A".to_owned(), "--".to_owned()];
-    add_args.extend(promoted_paths.iter().cloned());
-    run_git_checked(workdir, &add_args)?;
+    for rel in promoted_paths {
+        let target = workdir.join(rel);
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_file() => {
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    if meta.permissions().mode() & 0o111 != 0 {
+                        "100755"
+                    } else {
+                        "100644"
+                    }
+                };
+                #[cfg(not(unix))]
+                let mode = {
+                    let staged = run_git_no_filters(
+                        workdir,
+                        &filter_args,
+                        &[
+                            "ls-files".to_owned(),
+                            "--stage".to_owned(),
+                            "--".to_owned(),
+                            rel.clone(),
+                        ],
+                    )?;
+                    if staged.starts_with("100755 ") {
+                        "100755"
+                    } else {
+                        "100644"
+                    }
+                };
+                let oid = run_git_no_filters(
+                    workdir,
+                    &filter_args,
+                    &[
+                        "hash-object".to_owned(),
+                        "--no-filters".to_owned(),
+                        "-w".to_owned(),
+                        "--".to_owned(),
+                        rel.clone(),
+                    ],
+                )?;
+                run_git_no_filters(
+                    workdir,
+                    &filter_args,
+                    &[
+                        "update-index".to_owned(),
+                        "--add".to_owned(),
+                        "--cacheinfo".to_owned(),
+                        mode.to_owned(),
+                        oid,
+                        rel.clone(),
+                    ],
+                )?;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                run_git_no_filters(
+                    workdir,
+                    &filter_args,
+                    &[
+                        "update-index".to_owned(),
+                        "--force-remove".to_owned(),
+                        "--".to_owned(),
+                        rel.clone(),
+                    ],
+                )?;
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "refusing non-regular file in git commit promotion: {rel}"
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to inspect promoted file {rel} for git commit: {err}"
+                ));
+            }
+        }
+    }
 
     let mut diff_args = vec![
         "diff".to_owned(),
+        "--no-ext-diff".to_owned(),
+        "--no-textconv".to_owned(),
         "--cached".to_owned(),
         "--name-only".to_owned(),
         "--".to_owned(),
     ];
     diff_args.extend(promoted_paths.iter().cloned());
-    let staged_diff = run_git_checked(workdir, &diff_args)?;
+    let staged_diff = run_git_no_filters(workdir, &filter_args, &diff_args)?;
     if staged_diff.trim().is_empty() {
         return Err(
             "codex promoted files produced no git diff to commit for WorkspaceWrite task"
@@ -1915,23 +2009,25 @@ fn commit_promoted_writes(
     }
 
     let message = format!("storyflow({story}): task {task} r{task_revision}");
-    let mut commit_args = vec![
-        "-c".to_owned(),
-        "user.name=storyflow".to_owned(),
-        "-c".to_owned(),
-        "user.email=storyflow@local".to_owned(),
-        "-c".to_owned(),
-        "commit.gpgsign=false".to_owned(),
-        "-c".to_owned(),
-        hooks_arg,
-        "commit".to_owned(),
-        "--no-verify".to_owned(),
-        "-m".to_owned(),
-        message,
-        "--".to_owned(),
-    ];
-    commit_args.extend(promoted_paths.iter().cloned());
-    run_git_checked(workdir, &commit_args)?;
+    run_git_no_filters(
+        workdir,
+        &filter_args,
+        &[
+            "-c".to_owned(),
+            "user.name=storyflow".to_owned(),
+            "-c".to_owned(),
+            "user.email=storyflow@local".to_owned(),
+            "-c".to_owned(),
+            "commit.gpgsign=false".to_owned(),
+            "-c".to_owned(),
+            hooks_arg,
+            "commit".to_owned(),
+            "--no-verify".to_owned(),
+            "--no-status".to_owned(),
+            "-m".to_owned(),
+            message,
+        ],
+    )?;
 
     let head_after = run_git_checked(
         workdir,
@@ -1948,6 +2044,7 @@ fn commit_promoted_writes(
 }
 
 fn unstage_paths(workdir: &Path, promoted_paths: &[String]) -> Result<(), String> {
+    let filter_args = disabled_git_filter_args(workdir).unwrap_or_default();
     let mut reset_args = vec![
         "reset".to_owned(),
         "-q".to_owned(),
@@ -1955,7 +2052,7 @@ fn unstage_paths(workdir: &Path, promoted_paths: &[String]) -> Result<(), String
         "--".to_owned(),
     ];
     reset_args.extend(promoted_paths.iter().cloned());
-    run_git_checked(workdir, &reset_args).map(|_| ())
+    run_git_no_filters(workdir, &filter_args, &reset_args).map(|_| ())
 }
 
 fn capture_workdir_backups(

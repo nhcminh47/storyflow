@@ -47,15 +47,20 @@ struct Fixture {
     root: PathBuf,
     context: RunContext,
 }
+fn fixture_base_dir() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"))
+        .join("host-adapter-tests")
+}
+
 impl Fixture {
     fn new() -> Self {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target/host-adapter-tests")
-            .join(format!(
-                "{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+        let root = fixture_base_dir().join(format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(root.join(format!(".storyflow/{STORY}/events"))).unwrap();
         fs::create_dir_all(root.join("app")).unwrap();
         Self {
@@ -93,7 +98,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let allowed = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/host-adapter-tests");
+        let allowed = fixture_base_dir();
         assert!(self.root.starts_with(allowed));
         let _ = fs::remove_dir_all(&self.root);
     }
@@ -1626,36 +1631,84 @@ fn codex_adapter_enforces_read_scope_and_promotes_only_write_scope() {
 
     let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
 
-    // Without read-root confinement, unscoped/protected entries in workdir fail closed before spawning codex.
+    // Without read-root confinement or `--config`, probes refuse execution fail-closed before launching codex
+    // (even when the workdir contains only scoped files, because legacy `--sandbox` allows reading absolute paths outside workdir).
+    let clean_only_workdir = fixture.isolated_workdir("wt-clean-only");
+    fs::write(
+        clean_only_workdir.join("app/input.txt"),
+        "allowed context\n",
+    )
+    .unwrap();
+
     let unconfined_runner = Arc::new(
         MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_read_root_confinement(false),
     );
-    for _ in 0..2 {
-        unconfined_runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
-        unconfined_runner.push_ok(0, sandbox_help, "", false, false);
-    }
+    unconfined_runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    unconfined_runner.push_ok(0, sandbox_help, "", false, false);
     let unconfined_adapter =
         CodexAdapter::with_runner(CodexAdapterConfig::default(), unconfined_runner.clone());
     let cancel = CancelToken::new();
-    let refused = run_task(
+    let refused_clean = run_task(
         &mut journal,
         &unconfined_adapter,
         "a",
         "codex-host",
-        &workdir,
+        &clean_only_workdir,
         ExecutionPolicy::WorkspaceWrite,
         &cancel,
         &clock,
     )
     .unwrap();
-    assert_eq!(refused.status, ReconcileStatus::HostUnavailable);
-    assert!(refused.detail.contains("secrets"), "{refused:?}");
-    assert!(refused.detail.contains(".git"), "{refused:?}");
-    assert!(refused.detail.contains("AGENTS.md"), "{refused:?}");
-    // Only version + exec --help probes ran (dispatch + execute); codex exec never launched.
-    assert_eq!(unconfined_runner.calls().len(), 4);
+    assert_eq!(refused_clean.status, ReconcileStatus::HostUnavailable);
+    assert_eq!(refused_clean.attempt_id, None);
+    assert!(
+        refused_clean.detail.contains("--config")
+            || refused_clean.detail.contains("read-root confinement"),
+        "{refused_clean:?}"
+    );
+    assert_eq!(unconfined_runner.calls().len(), 2);
     assert!(unconfined_runner.observed_exec_paths().is_empty());
 
+    // Direct `Adapter::execute` also refuses execution fail-closed when read-root confinement is unavailable.
+    let direct_unconfined_runner = Arc::new(
+        MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_read_root_confinement(false),
+    );
+    direct_unconfined_runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    direct_unconfined_runner.push_ok(0, sandbox_help, "", false, false);
+    let direct_unconfined = CodexAdapter::with_runner(
+        CodexAdapterConfig::default(),
+        direct_unconfined_runner.clone(),
+    );
+    let direct_dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+    let direct_req = AdapterRequest {
+        schema: ADAPTER_SCHEMA,
+        dispatch: direct_dispatch.clone(),
+        workdir: workdir.clone(),
+        timeout_ms: 10_000,
+        policy: ExecutionPolicy::WorkspaceWrite,
+    };
+    let direct_outcome = direct_unconfined.execute(&direct_req, &cancel);
+    match direct_outcome {
+        AdapterOutcome::HostUnavailable { ref detail, .. } => {
+            assert!(
+                detail.contains("--config") || detail.contains("read-root confinement"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected HostUnavailable for unconfined execute, got {other:?}"),
+    }
+    assert!(direct_unconfined_runner.observed_exec_paths().is_empty());
+    let settled =
+        reconcile_outcome(&mut journal, &direct_dispatch, direct_outcome, &clock).unwrap();
+    assert_eq!(settled.status, ReconcileStatus::HostUnavailable);
     journal
         .retry_task(
             journal.view().revision.unwrap(),
@@ -1951,14 +2004,12 @@ fn codex_adapter_respects_case_sensitivity_in_task_scopes() {
 
     let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
 
-    // Unconfined runner must treat `secret/token.txt` as outside `read_scope: ["Secret"]`.
+    // Unconfined runner without `--config` must refuse execution fail-closed before launching codex.
     let unconfined = Arc::new(
         MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_read_root_confinement(false),
     );
-    for _ in 0..2 {
-        unconfined.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
-        unconfined.push_ok(0, sandbox_help, "", false, false);
-    }
+    unconfined.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    unconfined.push_ok(0, sandbox_help, "", false, false);
     let cancel = CancelToken::new();
     let unconfined_adapter =
         CodexAdapter::with_runner(CodexAdapterConfig::default(), unconfined.clone());
@@ -1974,19 +2025,14 @@ fn codex_adapter_respects_case_sensitivity_in_task_scopes() {
     )
     .unwrap();
     assert_eq!(refused.status, ReconcileStatus::HostUnavailable);
-    assert!(refused.detail.contains("secret"), "{refused:?}");
+    assert_eq!(refused.attempt_id, None);
+    assert!(
+        refused.detail.contains("--config") || refused.detail.contains("read-root confinement"),
+        "{refused:?}"
+    );
     assert!(unconfined.observed_exec_paths().is_empty());
 
     // Confined runner excludes `secret/token.txt` from staging and blocks lowercase write `secret/out.txt`.
-    journal
-        .retry_task(
-            journal.view().revision.unwrap(),
-            "a",
-            task_rev(&journal, "a"),
-            "retry with confined runner",
-            &clock,
-        )
-        .unwrap();
     let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
     for _ in 0..2 {
         runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
@@ -2688,14 +2734,12 @@ fn codex_adapter_does_not_collapse_unicode_nfc_and_nfd_scope_paths() {
 
     let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
 
-    // Unconfined runner must refuse the NFD sibling as outside NFC `read_scope`.
+    // Unconfined runner without `--config` must refuse execution fail-closed before launching codex.
     let unconfined = Arc::new(
         MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_read_root_confinement(false),
     );
-    for _ in 0..2 {
-        unconfined.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
-        unconfined.push_ok(0, sandbox_help, "", false, false);
-    }
+    unconfined.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    unconfined.push_ok(0, sandbox_help, "", false, false);
     let cancel = CancelToken::new();
     let unconfined_adapter =
         CodexAdapter::with_runner(CodexAdapterConfig::default(), unconfined.clone());
@@ -2711,19 +2755,14 @@ fn codex_adapter_does_not_collapse_unicode_nfc_and_nfd_scope_paths() {
     )
     .unwrap();
     assert_eq!(refused.status, ReconcileStatus::HostUnavailable);
-    assert!(refused.detail.contains("cafe\u{0301}"), "{refused:?}");
+    assert_eq!(refused.attempt_id, None);
+    assert!(
+        refused.detail.contains("--config") || refused.detail.contains("read-root confinement"),
+        "{refused:?}"
+    );
     assert!(unconfined.observed_exec_paths().is_empty());
 
     // Confined runner stages only the exact NFC spelling and blocks writing NFD sibling.
-    journal
-        .retry_task(
-            journal.view().revision.unwrap(),
-            "a",
-            task_rev(&journal, "a"),
-            "retry with confined runner",
-            &clock,
-        )
-        .unwrap();
     let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
     for _ in 0..2 {
         runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
@@ -2775,6 +2814,158 @@ fn codex_adapter_does_not_collapse_unicode_nfc_and_nfd_scope_paths() {
         !seen[0].iter().any(|p| p.contains("cafe\u{0301}")),
         "NFD sibling must not be staged: {:?}",
         seen[0]
+    );
+}
+
+#[test]
+fn codex_adapter_git_commit_ignores_configured_git_filters() {
+    fn run_git(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new(git_executable())
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    let fixture = Fixture::new();
+    let repo_root = fixture.root.join("git-repo-filters");
+    fs::create_dir_all(repo_root.join("app")).unwrap();
+    fs::write(repo_root.join(".gitignore"), ".storyflow/\n").unwrap();
+    fs::write(repo_root.join(".gitattributes"), "app/*.txt filter=evil\n").unwrap();
+    fs::write(repo_root.join("app/seed.txt"), "seed\n").unwrap();
+
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.name", "test"]);
+    run_git(&repo_root, &["config", "user.email", "test@local"]);
+    run_git(
+        &repo_root,
+        &["add", ".gitignore", ".gitattributes", "app/seed.txt"],
+    );
+    run_git(&repo_root, &["commit", "-m", "initial baseline"]);
+    let base = run_git(&repo_root, &["rev-parse", "HEAD"]);
+    fs::create_dir_all(repo_root.join(format!(".storyflow/{STORY}/events"))).unwrap();
+
+    let context = RunContext {
+        story: STORY.into(),
+        base: base.clone(),
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        blocked: false,
+        scope: vec!["app".into()],
+        protected: Vec::new(),
+    };
+    let mut impl_spec = spec("a", &[]);
+    impl_spec.stage = TaskStage::Implement;
+    let graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base,
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        tasks: vec![impl_spec],
+    };
+
+    let mut journal = TaskJournal::open(&repo_root, context.clone()).unwrap();
+    journal.initialize(graph.clone()).unwrap();
+    let clock = FakeClock::at(100);
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(1, 2), &clock)
+        .unwrap();
+    let dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+
+    let coordinator = IntegrationCoordinator::new(&repo_root, context).unwrap();
+    let worktree = coordinator
+        .prepare_worktree(journal.view(), Some(&graph), "a")
+        .unwrap();
+    let workdir = repo_root.join(&worktree.path);
+
+    let filter_sentinel = fixture.root.join("git-filter-executed.sentinel");
+    let sentinel_posix = filter_sentinel.to_string_lossy().replace('\\', "/");
+    let evil_cmd = format!("touch '{sentinel_posix}' && exit 1");
+    run_git(&repo_root, &["config", "filter.evil.clean", &evil_cmd]);
+    run_git(&repo_root, &["config", "filter.evil.process", &evil_cmd]);
+    run_git(&repo_root, &["config", "filter.evil.smudge", &evil_cmd]);
+    run_git(&repo_root, &["config", "filter.evil.required", "true"]);
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    runner.push_ok(0, sandbox_help, "", false, false);
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": dispatch.packet.task.revision,
+        "status": "succeeded",
+        "report": "wrote raw app/a.txt",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("app/a.txt", "raw bytes without filter execution\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let req = AdapterRequest {
+        schema: ADAPTER_SCHEMA,
+        dispatch: dispatch.clone(),
+        workdir: workdir.clone(),
+        timeout_ms: 10_000,
+        policy: ExecutionPolicy::WorkspaceWrite,
+    };
+    let outcome = adapter.execute(&req, &cancel);
+    let pinned = match &outcome {
+        AdapterOutcome::Completed { result, .. } => result
+            .commit
+            .clone()
+            .expect("adapter must commit promoted file without invoking filters"),
+        other => panic!("expected Completed outcome, got {other:?}"),
+    };
+    assert!(
+        !filter_sentinel.exists(),
+        "host-side git commit must never execute repository filter commands"
+    );
+
+    let committed_body = run_git(&workdir, &["show", &format!("{pinned}:app/a.txt")]);
+    assert_eq!(committed_body, "raw bytes without filter execution");
+
+    let report = reconcile_outcome(&mut journal, &dispatch, outcome, &clock).unwrap();
+    assert_eq!(report.status, ReconcileStatus::Applied, "{report:?}");
+    let status = coordinator.integrate(journal.view(), Some(&graph)).unwrap();
+    assert_eq!(
+        status.phase,
+        IntegrationPhase::Ready,
+        "{:?}",
+        status.blockers
+    );
+    assert!(status.candidate_commit.is_some());
+    assert!(
+        !filter_sentinel.exists(),
+        "filter must remain unexecuted across integration check"
     );
 }
 
