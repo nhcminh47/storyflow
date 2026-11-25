@@ -627,7 +627,13 @@ impl HostAdapter for CodexAdapter {
             }
         };
 
-        let worker_stopped = self.runner.has_unbroken_containment();
+        let pre_launch_cancelled = controlled.cancelled
+            && controlled.process.status.is_none()
+            && !controlled.process.timed_out
+            && controlled.process.stdout.is_empty()
+            && controlled.process.stderr.is_empty()
+            && !controlled.process.truncated;
+        let worker_stopped = pre_launch_cancelled || self.runner.has_unbroken_containment();
         let stdout_text = String::from_utf8_lossy(&controlled.process.stdout);
         let stderr_text = String::from_utf8_lossy(&controlled.process.stderr);
         let session_id = extract_session_id(&stdout_text)
@@ -1929,72 +1935,20 @@ fn commit_promoted_writes(
         .map_err(|err| format!("failed to allocate empty git hooks dir: {err}"))?;
     let hooks_arg = format!("core.hooksPath={}", hooks_dir.path().display());
 
+    let mut removals = Vec::new();
+    let mut additions = Vec::new();
     for rel in promoted_paths {
         let target = workdir.join(rel);
         match fs::symlink_metadata(&target) {
-            Ok(meta) if meta.file_type().is_file() => {
-                #[cfg(unix)]
-                let mode = {
-                    use std::os::unix::fs::PermissionsExt;
-                    if meta.permissions().mode() & 0o111 != 0 {
-                        "100755"
-                    } else {
-                        "100644"
-                    }
-                };
-                #[cfg(not(unix))]
-                let mode = {
-                    let staged = run_git_no_filters(
-                        workdir,
-                        &filter_args,
-                        &[
-                            "ls-files".to_owned(),
-                            "--stage".to_owned(),
-                            "--".to_owned(),
-                            rel.clone(),
-                        ],
-                    )?;
-                    if staged.starts_with("100755 ") {
-                        "100755"
-                    } else {
-                        "100644"
-                    }
-                };
-                let oid = run_git_no_filters(
-                    workdir,
-                    &filter_args,
-                    &[
-                        "hash-object".to_owned(),
-                        "--no-filters".to_owned(),
-                        "-w".to_owned(),
-                        "--".to_owned(),
-                        rel.clone(),
-                    ],
-                )?;
-                run_git_no_filters(
-                    workdir,
-                    &filter_args,
-                    &[
-                        "update-index".to_owned(),
-                        "--add".to_owned(),
-                        "--cacheinfo".to_owned(),
-                        mode.to_owned(),
-                        oid,
-                        rel.clone(),
-                    ],
-                )?;
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                run_git_no_filters(
-                    workdir,
-                    &filter_args,
-                    &[
-                        "update-index".to_owned(),
-                        "--force-remove".to_owned(),
-                        "--".to_owned(),
-                        rel.clone(),
-                    ],
-                )?;
+            Ok(meta) if meta.file_type().is_file() => additions.push((rel, meta)),
+            Ok(meta) if meta.file_type().is_dir() => removals.push(rel),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                removals.push(rel);
             }
             Ok(_) => {
                 return Err(format!(
@@ -2007,6 +1961,73 @@ fn commit_promoted_writes(
                 ));
             }
         }
+    }
+
+    for rel in removals {
+        run_git_no_filters(
+            workdir,
+            &filter_args,
+            &[
+                "update-index".to_owned(),
+                "--force-remove".to_owned(),
+                "--".to_owned(),
+                rel.clone(),
+            ],
+        )?;
+    }
+
+    for (rel, _meta) in additions {
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            if _meta.permissions().mode() & 0o111 != 0 {
+                "100755"
+            } else {
+                "100644"
+            }
+        };
+        #[cfg(not(unix))]
+        let mode = {
+            let staged = run_git_no_filters(
+                workdir,
+                &filter_args,
+                &[
+                    "ls-files".to_owned(),
+                    "--stage".to_owned(),
+                    "--".to_owned(),
+                    rel.clone(),
+                ],
+            )?;
+            if staged.starts_with("100755 ") {
+                "100755"
+            } else {
+                "100644"
+            }
+        };
+        let oid = run_git_no_filters(
+            workdir,
+            &filter_args,
+            &[
+                "hash-object".to_owned(),
+                "--no-filters".to_owned(),
+                "-w".to_owned(),
+                "--".to_owned(),
+                rel.clone(),
+            ],
+        )?;
+        run_git_no_filters(
+            workdir,
+            &filter_args,
+            &[
+                "update-index".to_owned(),
+                "--add".to_owned(),
+                "--replace".to_owned(),
+                "--cacheinfo".to_owned(),
+                mode.to_owned(),
+                oid,
+                rel.clone(),
+            ],
+        )?;
     }
 
     let mut diff_args = vec![
@@ -2938,7 +2959,7 @@ fn write_exclusive_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn read_last_message_file(path: &Path) -> Result<Option<String>, String> {
-    const MAX_LAST_MESSAGE_BYTES: u64 = 65_536;
+    const MAX_LAST_MESSAGE_BYTES: u64 = 512 * 1024;
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),

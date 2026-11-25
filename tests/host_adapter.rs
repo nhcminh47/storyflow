@@ -185,6 +185,7 @@ struct MockCodexRunner {
     calls: Mutex<Vec<HostCommandSpec>>,
     write_last_message: Mutex<Option<String>>,
     workspace_mutation: Mutex<Option<(PathBuf, String)>>,
+    remove_staged_paths: Mutex<Vec<PathBuf>>,
     permission_mutation: Mutex<Option<PathBuf>>,
     #[cfg(unix)]
     chmod_zero_targets: Mutex<Vec<PathBuf>>,
@@ -202,6 +203,7 @@ impl MockCodexRunner {
             calls: Mutex::new(Vec::new()),
             write_last_message: Mutex::new(None),
             workspace_mutation: Mutex::new(None),
+            remove_staged_paths: Mutex::new(Vec::new()),
             permission_mutation: Mutex::new(None),
             #[cfg(unix)]
             chmod_zero_targets: Mutex::new(Vec::new()),
@@ -240,6 +242,19 @@ impl MockCodexRunner {
         }));
     }
 
+    fn push_pre_launch_cancelled(&self) {
+        self.responses.lock().unwrap().push(Ok(ControlledResult {
+            process: ProcessResult {
+                status: None,
+                timed_out: false,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                truncated: false,
+            },
+            cancelled: true,
+        }));
+    }
+
     fn push_err(&self, kind: io::ErrorKind, msg: &str) {
         self.responses.lock().unwrap().push(Err(ProcessError {
             error: io::Error::new(kind, msg),
@@ -256,6 +271,10 @@ impl MockCodexRunner {
     fn set_workspace_mutation(&self, rel_path: &str, content: &str) {
         *self.workspace_mutation.lock().unwrap() =
             Some((PathBuf::from(rel_path), content.to_owned()));
+    }
+
+    fn set_remove_staged_paths(&self, rel_paths: &[&str]) {
+        *self.remove_staged_paths.lock().unwrap() = rel_paths.iter().map(PathBuf::from).collect();
     }
 
     fn set_permission_mutation(&self, rel_path: &str) {
@@ -312,6 +331,16 @@ impl CodexCommandRunner for MockCodexRunner {
             collect_rel_paths(_cwd, _cwd, &mut seen);
             self.observed_exec_paths.lock().unwrap().push(seen);
 
+            for rel in self.remove_staged_paths.lock().unwrap().drain(..) {
+                let target = _cwd.join(rel);
+                if let Ok(meta) = fs::symlink_metadata(&target) {
+                    if meta.file_type().is_dir() {
+                        fs::remove_dir_all(&target).unwrap();
+                    } else {
+                        fs::remove_file(&target).unwrap();
+                    }
+                }
+            }
             if let Some((rel, content)) = self.workspace_mutation.lock().unwrap().clone() {
                 let target = _cwd.join(rel);
                 if let Some(parent) = target.parent() {
@@ -3229,6 +3258,321 @@ fn non_completed_outcomes_reject_invalid_session_ids() {
             assert_eq!(journal.scheduler_status(&clock).unwrap().active_attempts, 0);
         }
     }
+}
+
+#[test]
+fn codex_adapter_treats_pre_launch_cancellation_as_stopped_without_containment() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-prelaunch-cancel");
+    fs::write(workdir.join("app/input.txt"), "allowed input\n").unwrap();
+
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_containment(false));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    runner.push_pre_launch_cancelled();
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.status, ReconcileStatus::Blocked, "{report:?}");
+    assert_eq!(report.code, "worker_cancelled");
+    assert!(report.worker_stopped);
+    assert_eq!(journal.scheduler_status(&clock).unwrap().active_attempts, 0);
+}
+
+#[test]
+fn codex_adapter_commits_file_directory_replacements_in_git_worktree() {
+    fn run_git(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new(git_executable())
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    let fixture = Fixture::new();
+    let repo_root = fixture.root.join("git-df-repo");
+    fs::create_dir_all(repo_root.join("app")).unwrap();
+    fs::write(repo_root.join(".gitignore"), ".storyflow/\n").unwrap();
+    fs::write(repo_root.join("app/node"), "file entry\n").unwrap();
+
+    run_git(&repo_root, &["init", "-b", "master"]);
+    run_git(&repo_root, &["config", "user.name", "test"]);
+    run_git(&repo_root, &["config", "user.email", "test@local"]);
+    run_git(&repo_root, &["add", ".gitignore", "app/node"]);
+    run_git(&repo_root, &["commit", "-m", "initial baseline"]);
+    let base = run_git(&repo_root, &["rev-parse", "HEAD"]);
+    fs::create_dir_all(repo_root.join(format!(".storyflow/{STORY}/events"))).unwrap();
+
+    let context = RunContext {
+        story: STORY.into(),
+        base: base.clone(),
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        blocked: false,
+        scope: vec!["app".into()],
+        protected: Vec::new(),
+    };
+    let mut impl_a = spec("a", &[]);
+    impl_a.stage = TaskStage::Implement;
+    impl_a.write_scope = vec!["app".into()];
+    let mut impl_b = spec("b", &["a"]);
+    impl_b.stage = TaskStage::Implement;
+    impl_b.write_scope = vec!["app".into()];
+    let graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base,
+        story_revision: 1,
+        stage: TaskStage::Implement,
+        tasks: vec![impl_a, impl_b],
+    };
+
+    let mut journal = TaskJournal::open(&repo_root, context.clone()).unwrap();
+    journal.initialize(graph.clone()).unwrap();
+    let clock = FakeClock::at(100);
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(1, 3), &clock)
+        .unwrap();
+
+    let coordinator = IntegrationCoordinator::new(&repo_root, context).unwrap();
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+
+    // Case 1: task `a` replaces tracked file `app/node` with directory `app/node/child.txt`.
+    let dispatch1 = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+    let worktree1 = coordinator
+        .prepare_worktree(journal.view(), Some(&graph), "a")
+        .unwrap();
+    let workdir1 = repo_root.join(&worktree1.path);
+
+    let runner1 = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    runner1.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    runner1.push_ok(0, sandbox_help, "", false, false);
+    let result_json1 = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": dispatch1.packet.task.revision,
+        "status": "succeeded",
+        "report": "replaced file app/node with directory app/node/child.txt",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner1.set_remove_staged_paths(&["app/node"]);
+    runner1.set_workspace_mutation("app/node/child.txt", "nested child\n");
+    runner1.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json1).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter1 = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner1);
+    let cancel = CancelToken::new();
+    let outcome1 = adapter1.execute(
+        &AdapterRequest {
+            schema: ADAPTER_SCHEMA,
+            dispatch: dispatch1.clone(),
+            workdir: workdir1.clone(),
+            timeout_ms: 10_000,
+            policy: ExecutionPolicy::WorkspaceWrite,
+        },
+        &cancel,
+    );
+    let commit1 = match &outcome1 {
+        AdapterOutcome::Completed { result, .. } => result
+            .commit
+            .clone()
+            .expect("D->F replacement must produce a commit"),
+        other => panic!("expected Completed outcome for file->dir replacement, got {other:?}"),
+    };
+    let tree1 = run_git(&workdir1, &["ls-tree", "-r", "--name-only", &commit1]);
+    let lines1: Vec<&str> = tree1.lines().collect();
+    assert!(lines1.contains(&"app/node/child.txt"), "{lines1:?}");
+    assert!(!lines1.contains(&"app/node"), "{lines1:?}");
+
+    // Case 2: dependent task `b` performs reverse transition (`app/node/child.txt` -> file `app/node`).
+    let report1 = reconcile_outcome(&mut journal, &dispatch1, outcome1, &clock).unwrap();
+    assert_eq!(report1.status, ReconcileStatus::Applied);
+    let dispatch2 = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "b",
+            task_rev(&journal, "b"),
+            "codex-host",
+            &clock,
+        )
+        .unwrap();
+    let worktree2 = coordinator
+        .prepare_worktree(journal.view(), Some(&graph), "b")
+        .unwrap();
+    let workdir2 = repo_root.join(&worktree2.path);
+
+    let runner2 = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    runner2.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+    runner2.push_ok(0, sandbox_help, "", false, false);
+    let result_json2 = json!({
+        "story": STORY,
+        "task": "b",
+        "task_revision": dispatch2.packet.task.revision,
+        "status": "succeeded",
+        "report": "replaced dir app/node with file app/node",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner2.set_remove_staged_paths(&["app/node"]);
+    runner2.set_workspace_mutation("app/node", "back to file\n");
+    runner2.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json2).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter2 = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner2);
+    let outcome2 = adapter2.execute(
+        &AdapterRequest {
+            schema: ADAPTER_SCHEMA,
+            dispatch: dispatch2.clone(),
+            workdir: workdir2.clone(),
+            timeout_ms: 10_000,
+            policy: ExecutionPolicy::WorkspaceWrite,
+        },
+        &cancel,
+    );
+    let commit2 = match &outcome2 {
+        AdapterOutcome::Completed { result, .. } => result
+            .commit
+            .clone()
+            .expect("F->D replacement must produce a commit"),
+        other => panic!("expected Completed outcome for dir->file replacement, got {other:?}"),
+    };
+    let tree2 = run_git(&workdir2, &["ls-tree", "-r", "--name-only", &commit2]);
+    let lines2: Vec<&str> = tree2.lines().collect();
+    assert!(lines2.contains(&"app/node"), "{lines2:?}");
+    assert!(!lines2.contains(&"app/node/child.txt"), "{lines2:?}");
+
+    let report2 = reconcile_outcome(&mut journal, &dispatch2, outcome2, &clock).unwrap();
+    assert_eq!(report2.status, ReconcileStatus::Applied);
+    let status = coordinator.integrate(journal.view(), Some(&graph)).unwrap();
+    assert_eq!(
+        status.phase,
+        IntegrationPhase::Ready,
+        "{:?}",
+        status.blockers
+    );
+    assert!(status.candidate_commit.is_some());
+}
+
+#[test]
+fn codex_adapter_accepts_large_valid_last_message_with_64_artifacts() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-large-last-msg");
+    fs::write(workdir.join("app/input.txt"), "allowed input\n").unwrap();
+
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let full_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json --output-schema <FILE> --output-last-message <FILE> - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, full_help, "", false, false);
+    }
+
+    let artifacts: Vec<serde_json::Value> = (0..64)
+        .map(|i| {
+            json!({
+                "path": format!("app/art-{i:02}-{}.txt", "x".repeat(990)),
+                "sha256": "a".repeat(64),
+            })
+        })
+        .collect();
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": task_rev(&journal, "a") + 1,
+        "status": "succeeded",
+        "report": "completed with 64 artifacts",
+        "commit": null,
+        "artifacts": artifacts,
+    })
+    .to_string();
+    assert!(
+        result_json.len() > 65_536,
+        "expected > 64 KiB JSON payload, got {} bytes",
+        result_json.len()
+    );
+    runner.set_last_message(&result_json);
+    runner.push_ok(
+        0,
+        "{\"type\":\"thread.started\",\"thread_id\":\"th_large_msg\"}\n",
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.status, ReconcileStatus::Applied, "{report:?}");
+    let rec = &journal.view().tasks["a"];
+    assert_eq!(rec.status, TaskStatus::Succeeded);
+    assert_eq!(
+        rec.result.as_ref().unwrap().artifacts.len(),
+        64,
+        "all 64 artifacts must survive last-message read"
+    );
 }
 
 #[test]
