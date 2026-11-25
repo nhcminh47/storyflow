@@ -784,6 +784,7 @@ impl HostAdapter for CodexAdapter {
                 &before_snapshot,
                 &after_snapshot,
                 &request.dispatch.packet.task.spec.write_scope,
+                self.config.max_backup_bytes,
             ) {
                 Ok(promoted) => promoted,
                 Err(detail) => {
@@ -1263,12 +1264,33 @@ enum WorkdirBackupEntry {
     File { bytes: Vec<u8>, mode: u32 },
 }
 
+fn read_bounded_file(path: &Path, limit: usize, context: &str) -> Result<Vec<u8>, String> {
+    let meta =
+        fs::symlink_metadata(path).map_err(|err| format!("failed to inspect {context}: {err}"))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("refusing non-regular file for {context}"));
+    }
+    if meta.len() > limit as u64 {
+        return Err(format!("{context} exceeds backup size limit"));
+    }
+    let file = fs::File::open(path).map_err(|err| format!("failed to open {context}: {err}"))?;
+    let mut buf = Vec::new();
+    file.take((limit as u64).saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|err| format!("failed to read {context}: {err}"))?;
+    if buf.len() > limit {
+        return Err(format!("{context} exceeds backup size limit"));
+    }
+    Ok(buf)
+}
+
 fn apply_staged_writes(
     staging_root: &Path,
     workdir: &Path,
     before: &WorkspaceSnapshot,
     after: &WorkspaceSnapshot,
     write_scope: &[String],
+    max_backup_bytes: usize,
 ) -> Result<PromotedWrites, String> {
     apply_staged_writes_with(
         staging_root,
@@ -1276,6 +1298,7 @@ fn apply_staged_writes(
         before,
         after,
         write_scope,
+        max_backup_bytes,
         |_| Ok(()),
     )
 }
@@ -1286,11 +1309,13 @@ fn apply_staged_writes_with(
     before: &WorkspaceSnapshot,
     after: &WorkspaceSnapshot,
     write_scope: &[String],
+    max_backup_bytes: usize,
     on_write: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<PromotedWrites, String> {
     let all_paths: BTreeSet<&String> = before.entries.keys().chain(after.entries.keys()).collect();
     let mut ops = Vec::new();
     let mut promoted_paths = Vec::new();
+    let mut staged_bytes: usize = 0;
 
     for path in all_paths {
         let prev = before.entries.get(path);
@@ -1324,9 +1349,13 @@ fn apply_staged_writes_with(
                 ));
             }
             (_, Some(SnapshotEntry::File { mode, .. })) => {
-                let bytes = fs::read(&staged_path).map_err(|err| {
-                    format!("failed to read staged output {path} before promotion: {err}")
-                })?;
+                let remaining = max_backup_bytes.saturating_sub(staged_bytes);
+                let bytes = read_bounded_file(
+                    &staged_path,
+                    remaining,
+                    &format!("staged output {path} before promotion"),
+                )?;
+                staged_bytes = staged_bytes.saturating_add(bytes.len());
                 promoted_paths.push(path.clone());
                 ops.push(StagedWriteOp::WriteFile {
                     rel: path.clone(),
@@ -1366,7 +1395,7 @@ fn apply_staged_writes_with(
         });
     }
 
-    let backups = capture_workdir_backups(workdir, &ops)?;
+    let backups = capture_workdir_backups(workdir, &ops, max_backup_bytes)?;
     if let Err(apply_err) = apply_write_ops(workdir, &ops, on_write) {
         let rollback_errors = rollback_workdir_promotion(workdir, &backups);
         if rollback_errors.is_empty() {
@@ -2097,8 +2126,10 @@ fn unstage_paths(workdir: &Path, promoted_paths: &[String]) -> Result<(), String
 fn capture_workdir_backups(
     workdir: &Path,
     ops: &[StagedWriteOp],
+    max_backup_bytes: usize,
 ) -> Result<BTreeMap<String, WorkdirBackupEntry>, String> {
     let mut backups = BTreeMap::new();
+    let mut backup_bytes: usize = 0;
     let mut record_path = |rel: &str| -> Result<(), String> {
         if backups.contains_key(rel) {
             return Ok(());
@@ -2118,9 +2149,13 @@ fn capture_workdir_backups(
                 Ok(())
             }
             Ok(meta) if meta.file_type().is_file() => {
-                let bytes = fs::read(&target).map_err(|err| {
-                    format!("failed to back up {rel} in workdir before promotion: {err}")
-                })?;
+                let remaining = max_backup_bytes.saturating_sub(backup_bytes);
+                let bytes = read_bounded_file(
+                    &target,
+                    remaining,
+                    &format!("destination backup {rel} in workdir"),
+                )?;
+                backup_bytes = backup_bytes.saturating_add(bytes.len());
                 backups.insert(
                     rel.to_owned(),
                     WorkdirBackupEntry::File {
@@ -3077,6 +3112,7 @@ mod tests {
             &before,
             &after,
             &write_scope,
+            MAX_BACKUP_BYTES,
             |rel| {
                 if rel == "app/first.txt" {
                     saw_first_write = true;
@@ -3098,6 +3134,40 @@ mod tests {
         assert!(
             !workdir.path().join("app/new.txt").exists(),
             "newly created file in failed batch must be removed on rollback"
+        );
+    }
+
+    #[test]
+    fn apply_staged_writes_rejects_oversized_destination_backup() {
+        let staging = TempArtifactsDir::new().unwrap();
+        let workdir = TempArtifactsDir::new().unwrap();
+
+        let original = vec![b'Z'; 512];
+        fs::create_dir_all(workdir.path().join("app")).unwrap();
+        fs::write(workdir.path().join("app/large.bin"), &original).unwrap();
+
+        // Excluded from read_scope, so before_snapshot does not contain app/large.bin.
+        fs::create_dir_all(staging.path().join("app")).unwrap();
+        let before = snapshot_workspace(staging.path(), true, 128).unwrap();
+
+        fs::write(staging.path().join("app/large.bin"), b"replaced").unwrap();
+        let after = snapshot_workspace(staging.path(), false, 0).unwrap();
+
+        let err = apply_staged_writes_with(
+            staging.path(),
+            workdir.path(),
+            &before,
+            &after,
+            &["app/large.bin".to_owned()],
+            128,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.contains("size limit"), "{err}");
+        assert_eq!(
+            fs::read(workdir.path().join("app/large.bin")).unwrap(),
+            original,
+            "destination file must remain untouched when backup budget is exceeded"
         );
     }
 
