@@ -82,6 +82,12 @@ pub trait CodexCommandRunner: Send + Sync {
     fn has_read_root_confinement(&self) -> bool {
         true
     }
+
+    /// Returns `true` if the host's ambient Codex config defines legacy
+    /// `sandbox_mode` or `sandbox_workspace_write` keys that override `default_permissions`.
+    fn ambient_config_sets_legacy_sandbox(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -136,6 +142,16 @@ impl CodexCommandRunner for ProcessCommandRunner {
         // Legacy `codex exec --sandbox read-only|workspace-write` grants full-filesystem
         // read access and cannot isolate omitted files in the workspace.
         false
+    }
+
+    fn ambient_config_sets_legacy_sandbox(&self) -> bool {
+        ambient_codex_config_paths()
+            .into_iter()
+            .any(|path| match fs::read_to_string(&path) {
+                Ok(text) => config_toml_sets_legacy_sandbox(&text),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            })
     }
 }
 
@@ -385,6 +401,13 @@ impl HostAdapter for CodexAdapter {
         let use_config_confinement =
             !self.runner.has_read_root_confinement() && supports_config_read_confinement(&caps);
 
+        if use_config_confinement && self.runner.ambient_config_sets_legacy_sandbox() {
+            return AdapterOutcome::HostUnavailable {
+                provider: "codex".to_owned(),
+                detail: "ambient codex config.toml sets legacy sandbox_mode or sandbox_workspace_write, which deactivates scoped default_permissions confinement".to_owned(),
+            };
+        }
+
         if !self.runner.has_read_root_confinement() && !use_config_confinement {
             match find_unscoped_workdir_entries(
                 &request.workdir,
@@ -528,11 +551,6 @@ impl HostAdapter for CodexAdapter {
             args.push("--cd".to_owned());
             args.push(staging_dir.path().to_string_lossy().into_owned());
         }
-        args.push("--sandbox".to_owned());
-        args.push(match request.policy {
-            ExecutionPolicy::ReadOnly => "read-only".to_owned(),
-            ExecutionPolicy::WorkspaceWrite => "workspace-write".to_owned(),
-        });
         if use_config_confinement {
             append_config_read_confinement(
                 &mut args,
@@ -540,6 +558,12 @@ impl HostAdapter for CodexAdapter {
                 &request.workdir,
                 request.policy,
             );
+        } else {
+            args.push("--sandbox".to_owned());
+            args.push(match request.policy {
+                ExecutionPolicy::ReadOnly => "read-only".to_owned(),
+                ExecutionPolicy::WorkspaceWrite => "workspace-write".to_owned(),
+            });
         }
         if caps.supports_json_output {
             args.push("--json".to_owned());
@@ -1376,6 +1400,52 @@ fn apply_staged_writes_with(
     })
 }
 
+fn ambient_codex_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(codex_home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        paths.push(PathBuf::from(codex_home).join("config.toml"));
+        return paths;
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        paths.push(PathBuf::from(home).join(".codex").join("config.toml"));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+        let candidate = PathBuf::from(profile).join(".codex").join("config.toml");
+        if !paths.contains(&candidate) {
+            paths.push(candidate);
+        }
+    }
+    paths
+}
+
+fn config_toml_sets_legacy_sandbox(text: &str) -> bool {
+    for raw_line in text.lines() {
+        let code = raw_line.split('#').next().unwrap_or("").trim();
+        if code.is_empty() {
+            continue;
+        }
+        if let Some(table) = code.strip_prefix('[') {
+            let section = table.trim_end_matches(']').trim();
+            if section == "sandbox_workspace_write"
+                || section.starts_with("sandbox_workspace_write.")
+            {
+                return true;
+            }
+            continue;
+        }
+        if let Some((key, _)) = code.split_once('=') {
+            let key = key.trim();
+            if key == "sandbox_mode"
+                || key == "sandbox_workspace_write"
+                || key.starts_with("sandbox_workspace_write.")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn supports_config_read_confinement(caps: &HostCapabilities) -> bool {
     caps.detected_flags.iter().any(|f| f == "--config")
 }
@@ -1391,6 +1461,7 @@ fn append_config_read_confinement(
         args.push(kv);
     };
     push_cfg("default_permissions=\"storyflow_scoped\"".to_owned());
+    push_cfg("permissions.storyflow_scoped.network.enabled=false".to_owned());
     push_cfg("permissions.storyflow_scoped.filesystem.\":root\"=\"deny\"".to_owned());
     push_cfg("permissions.storyflow_scoped.filesystem.\":minimal\"=\"read\"".to_owned());
 
@@ -2584,5 +2655,21 @@ mod tests {
             !workdir.path().join("app/new.txt").exists(),
             "newly created file in failed batch must be removed on rollback"
         );
+    }
+
+    #[test]
+    fn config_toml_detects_legacy_sandbox_keys() {
+        assert!(!config_toml_sets_legacy_sandbox(
+            "# sandbox_mode = \"workspace-write\"\ndefault_permissions = \":workspace\"\n"
+        ));
+        assert!(config_toml_sets_legacy_sandbox(
+            "model = \"gpt-5\"\nsandbox_mode = \"workspace-write\"\n"
+        ));
+        assert!(config_toml_sets_legacy_sandbox(
+            "[sandbox_workspace_write]\nnetwork_access = false\n"
+        ));
+        assert!(config_toml_sets_legacy_sandbox(
+            "sandbox_workspace_write.writable_roots = [\"/tmp\"]\n"
+        ));
     }
 }

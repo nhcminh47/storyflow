@@ -2451,10 +2451,22 @@ fn codex_adapter_confines_reads_via_config_in_git_worktree() {
     let calls = runner.calls();
     let exec_call = calls.last().unwrap();
     assert!(
+        !exec_call.args.iter().any(|a| a == "--sandbox"),
+        "legacy --sandbox flag must be omitted when activating default_permissions profile: {:?}",
+        exec_call.args
+    );
+    assert!(
         exec_call
             .args
             .windows(2)
             .any(|w| { w[0] == "--config" && w[1] == "default_permissions=\"storyflow_scoped\"" }),
+        "{:?}",
+        exec_call.args
+    );
+    assert!(
+        exec_call.args.windows(2).any(|w| {
+            w[0] == "--config" && w[1] == "permissions.storyflow_scoped.network.enabled=false"
+        }),
         "{:?}",
         exec_call.args
     );
