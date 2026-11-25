@@ -341,13 +341,24 @@ impl HostAdapter for CodexAdapter {
             }
         };
 
-        parse_exec_help(
+        let mut caps = parse_exec_help(
             &exe_str,
             version,
             &help_text,
             self.runner.has_unbroken_containment(),
             self.runner.has_read_root_confinement(),
-        )
+        );
+        if caps.available
+            && !self.runner.has_read_root_confinement()
+            && supports_config_read_confinement(&caps)
+            && self.runner.ambient_config_sets_legacy_sandbox()
+        {
+            caps.available = false;
+            caps.unavailable_reason = Some(
+                "ambient codex config.toml sets legacy sandbox_mode or sandbox_workspace_write, which deactivates scoped default_permissions confinement".to_owned(),
+            );
+        }
+        caps
     }
 
     fn execute(&self, request: &AdapterRequest, cancel: &CancelToken) -> AdapterOutcome {

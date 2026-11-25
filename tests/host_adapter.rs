@@ -191,6 +191,7 @@ struct MockCodexRunner {
     observed_exec_paths: Mutex<Vec<Vec<String>>>,
     unbroken_containment: bool,
     read_root_confinement: bool,
+    ambient_legacy_sandbox: bool,
 }
 
 impl MockCodexRunner {
@@ -207,6 +208,7 @@ impl MockCodexRunner {
             observed_exec_paths: Mutex::new(Vec::new()),
             unbroken_containment: true,
             read_root_confinement: true,
+            ambient_legacy_sandbox: false,
         }
     }
 
@@ -217,6 +219,11 @@ impl MockCodexRunner {
 
     fn with_read_root_confinement(mut self, confined: bool) -> Self {
         self.read_root_confinement = confined;
+        self
+    }
+
+    fn with_ambient_legacy_sandbox(mut self, ambient: bool) -> Self {
+        self.ambient_legacy_sandbox = ambient;
         self
     }
 
@@ -355,6 +362,10 @@ impl CodexCommandRunner for MockCodexRunner {
 
     fn has_read_root_confinement(&self) -> bool {
         self.read_root_confinement
+    }
+
+    fn ambient_config_sets_legacy_sandbox(&self) -> bool {
+        self.ambient_legacy_sandbox
     }
 }
 
@@ -3074,6 +3085,150 @@ fn read_only_task_with_empty_write_scope_rejects_claimed_commit() {
         "{runner_report:?}"
     );
     assert_eq!(journal.view().tasks["a"].status, TaskStatus::Blocked);
+}
+
+#[test]
+fn codex_probe_rejects_ambient_legacy_sandbox_before_reserving_attempt() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-ambient-sandbox");
+    fs::write(workdir.join("app/input.txt"), "allowed input\n").unwrap();
+
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+    let rev_before = journal.view().revision.unwrap();
+
+    let help_with_config =
+        "Usage: codex exec --cd <DIR> --sandbox <MODE> --config <KEY=VALUE> --json - [PROMPT]\n";
+    let runner = Arc::new(
+        MockCodexRunner::new(Ok(PathBuf::from("codex")))
+            .with_read_root_confinement(false)
+            .with_ambient_legacy_sandbox(true),
+    );
+    // One probe pair for explicit `adapter.probe()`, one probe pair for `dispatch_and_run`.
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, help_with_config, "", false, false);
+    }
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
+    let caps = adapter.probe();
+    assert!(!caps.available);
+    assert!(
+        caps.unavailable_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("sandbox_mode")),
+        "{caps:?}"
+    );
+
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(report.status, ReconcileStatus::HostUnavailable);
+    assert_eq!(report.attempt_id, None);
+    assert_eq!(journal.view().tasks["a"].status, TaskStatus::Ready);
+    assert_eq!(journal.view().revision.unwrap(), rev_before);
+    assert_eq!(journal.scheduler_status(&clock).unwrap().active_attempts, 0);
+    assert!(runner.observed_exec_paths().is_empty());
+}
+
+#[test]
+fn non_completed_outcomes_reject_invalid_session_ids() {
+    type OutcomeFactory = fn(SessionCorrelation, bool) -> AdapterOutcome;
+    let cases: [(&str, OutcomeFactory); 4] = [
+        ("cancelled", |correlation, worker_stopped| {
+            AdapterOutcome::Cancelled {
+                correlation,
+                worker_stopped,
+                reason: "worker cancelled".into(),
+            }
+        }),
+        ("timed_out", |correlation, worker_stopped| {
+            AdapterOutcome::TimedOut {
+                correlation,
+                worker_stopped,
+                reason: "worker timed out".into(),
+            }
+        }),
+        ("host_crashed", |correlation, worker_stopped| {
+            AdapterOutcome::HostCrashed {
+                correlation,
+                worker_stopped,
+                exit_code: Some(1),
+                detail: "process died".into(),
+            }
+        }),
+        ("invalid_output", |correlation, worker_stopped| {
+            AdapterOutcome::InvalidOutput {
+                correlation,
+                worker_stopped,
+                detail: "bad json".into(),
+            }
+        }),
+    ];
+
+    let invalid_ids = [String::new(), "bad\nsession".to_owned(), "x".repeat(300)];
+
+    for (label, build_outcome) in cases {
+        for bad_session in &invalid_ids {
+            let fixture = Fixture::new();
+            let clock = FakeClock::at(100);
+            let mut journal = fixture.configured(policy(1, 3), &clock);
+            let dispatch = journal
+                .dispatch(
+                    journal.view().revision.unwrap(),
+                    "a",
+                    task_rev(&journal, "a"),
+                    "host-1",
+                    &clock,
+                )
+                .unwrap();
+
+            let mut bad_corr = SessionCorrelation::from_lease(&dispatch.lease, "valid-placeholder");
+            bad_corr.session_id = bad_session.clone();
+
+            let unstopped_report = reconcile_outcome(
+                &mut journal,
+                &dispatch,
+                build_outcome(bad_corr.clone(), false),
+                &clock,
+            )
+            .unwrap();
+            assert_eq!(
+                unstopped_report.status,
+                ReconcileStatus::BlockedUnstopped,
+                "case {label} should stay unstopped"
+            );
+            assert_eq!(unstopped_report.session_id, None);
+            assert_eq!(journal.scheduler_status(&clock).unwrap().active_attempts, 1);
+
+            let stopped_report = reconcile_outcome(
+                &mut journal,
+                &dispatch,
+                build_outcome(bad_corr, true),
+                &clock,
+            )
+            .unwrap();
+            assert_eq!(
+                stopped_report.status,
+                ReconcileStatus::Blocked,
+                "case {label} should block on invalid session_id"
+            );
+            assert_eq!(stopped_report.code, "correlation_mismatch");
+            assert_eq!(stopped_report.session_id, None);
+            assert!(stopped_report.worker_stopped);
+            assert_eq!(journal.view().tasks["a"].status, TaskStatus::Blocked);
+            assert_eq!(journal.scheduler_status(&clock).unwrap().active_attempts, 0);
+        }
+    }
 }
 
 #[test]

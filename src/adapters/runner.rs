@@ -135,7 +135,10 @@ pub fn reconcile_outcome(
 ) -> TaskResult<ReconcileReport> {
     let task_id = dispatch.packet.task.spec.id.clone();
     let attempt_id = dispatch.lease.attempt_id.clone();
-    let session_id = outcome.session_id().map(str::to_owned);
+    let session_id = outcome
+        .correlation()
+        .filter(|corr| corr.validate().is_ok())
+        .map(|corr| corr.session_id.clone());
 
     let Some(scheduler) = journal.view().scheduler.as_ref() else {
         return Ok(rejected_report(
@@ -344,11 +347,36 @@ pub fn reconcile_outcome(
         ));
     }
 
+    if let Some(correlation) = outcome.correlation()
+        && let Err(err) = validate_correlation(correlation, &dispatch.lease)
+    {
+        if !worker_stopped {
+            return Ok(unstopped_report(
+                "worker_stop_required",
+                "outcome with invalid session correlation cannot settle while worker_stopped is false",
+                task_id,
+                attempt_id,
+                None,
+                Some(rev),
+            ));
+        }
+        let reason = sanitize_reason(&err);
+        journal.confirm_stopped(rev, &dispatch.lease, &reason, clock)?;
+        return Ok(blocked_report(
+            "correlation_mismatch",
+            reason,
+            task_id,
+            attempt_id,
+            None,
+            journal.view().revision,
+        ));
+    }
+
     match outcome {
         AdapterOutcome::Completed {
-            correlation,
             result,
             worker_stopped,
+            ..
         } => {
             if !worker_stopped {
                 return Ok(unstopped_report(
@@ -356,20 +384,8 @@ pub fn reconcile_outcome(
                     "completion refused without explicit worker_stopped confirmation",
                     task_id,
                     attempt_id,
-                    Some(correlation.session_id),
+                    session_id,
                     Some(rev),
-                ));
-            }
-            if let Err(err) = validate_correlation(&correlation, &dispatch.lease) {
-                let reason = sanitize_reason(&err);
-                journal.confirm_stopped(rev, &dispatch.lease, &reason, clock)?;
-                return Ok(blocked_report(
-                    "correlation_mismatch",
-                    reason,
-                    task_id,
-                    attempt_id,
-                    Some(correlation.session_id),
-                    journal.view().revision,
                 ));
             }
             if let Err(err) = validate_worker_result(&result, dispatch) {
@@ -380,7 +396,7 @@ pub fn reconcile_outcome(
                     reason,
                     task_id,
                     attempt_id,
-                    Some(correlation.session_id),
+                    session_id,
                     journal.view().revision,
                 ));
             }
@@ -407,16 +423,16 @@ pub fn reconcile_outcome(
                 detail,
                 task: task_id,
                 attempt_id: Some(attempt_id),
-                session_id: Some(correlation.session_id),
+                session_id,
                 worker_stopped: true,
                 recoverable,
                 ledger_revision: journal.view().revision,
             })
         }
         AdapterOutcome::Cancelled {
-            correlation,
             worker_stopped,
             reason,
+            ..
         } => {
             if !worker_stopped {
                 return Ok(unstopped_report(
@@ -424,7 +440,7 @@ pub fn reconcile_outcome(
                     "cancelled worker has not confirmed exit",
                     task_id,
                     attempt_id,
-                    Some(correlation.session_id),
+                    session_id,
                     Some(rev),
                 ));
             }
@@ -445,16 +461,16 @@ pub fn reconcile_outcome(
                 detail,
                 task: task_id,
                 attempt_id: Some(attempt_id),
-                session_id: Some(correlation.session_id),
+                session_id,
                 worker_stopped: true,
                 recoverable: !task_cancelled,
                 ledger_revision: journal.view().revision,
             })
         }
         AdapterOutcome::TimedOut {
-            correlation,
             worker_stopped,
             reason,
+            ..
         } => {
             if !worker_stopped {
                 return Ok(unstopped_report(
@@ -462,7 +478,7 @@ pub fn reconcile_outcome(
                     "timed-out worker has not confirmed exit",
                     task_id,
                     attempt_id,
-                    Some(correlation.session_id),
+                    session_id,
                     Some(rev),
                 ));
             }
@@ -473,15 +489,15 @@ pub fn reconcile_outcome(
                 detail,
                 task_id,
                 attempt_id,
-                Some(correlation.session_id),
+                session_id,
                 journal.view().revision,
             ))
         }
         AdapterOutcome::HostCrashed {
-            correlation,
             worker_stopped,
             exit_code,
             detail,
+            ..
         } => {
             if !worker_stopped {
                 return Ok(unstopped_report(
@@ -489,7 +505,7 @@ pub fn reconcile_outcome(
                     "crashed host process tree was not confirmed stopped",
                     task_id,
                     attempt_id,
-                    Some(correlation.session_id),
+                    session_id,
                     Some(rev),
                 ));
             }
@@ -503,14 +519,14 @@ pub fn reconcile_outcome(
                 msg,
                 task_id,
                 attempt_id,
-                Some(correlation.session_id),
+                session_id,
                 journal.view().revision,
             ))
         }
         AdapterOutcome::InvalidOutput {
-            correlation,
             worker_stopped,
             detail,
+            ..
         } => {
             if !worker_stopped {
                 return Ok(unstopped_report(
@@ -518,7 +534,7 @@ pub fn reconcile_outcome(
                     "host produced invalid output and worker exit is unconfirmed",
                     task_id,
                     attempt_id,
-                    Some(correlation.session_id),
+                    session_id,
                     Some(rev),
                 ));
             }
@@ -529,7 +545,7 @@ pub fn reconcile_outcome(
                 msg,
                 task_id,
                 attempt_id,
-                Some(correlation.session_id),
+                session_id,
                 journal.view().revision,
             ))
         }
