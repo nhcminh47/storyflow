@@ -737,6 +737,13 @@ impl HostAdapter for CodexAdapter {
                 detail: sanitize_reason(&format!("invalid codex worker result: {err}")),
             };
         }
+        if request.policy == ExecutionPolicy::ReadOnly && result.commit.is_some() {
+            return AdapterOutcome::InvalidOutput {
+                correlation,
+                worker_stopped,
+                detail: "read-only codex execution must not claim a commit".to_owned(),
+            };
+        }
 
         if worker_stopped
             && request.policy == ExecutionPolicy::WorkspaceWrite

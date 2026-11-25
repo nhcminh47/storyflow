@@ -2970,6 +2970,113 @@ fn codex_adapter_git_commit_ignores_configured_git_filters() {
 }
 
 #[test]
+fn read_only_task_with_empty_write_scope_rejects_claimed_commit() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-ro-commit");
+    fs::write(workdir.join("app/input.txt"), "read-only input\n").unwrap();
+
+    let mut ro_spec = spec("a", &[]);
+    ro_spec.write_scope.clear();
+    let ro_graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: "1".repeat(40),
+        story_revision: 0,
+        stage: TaskStage::Plan,
+        tasks: vec![ro_spec],
+    };
+
+    let clock = FakeClock::at(100);
+    let mut journal = TaskJournal::open(&fixture.root, fixture.context.clone()).unwrap();
+    journal.initialize(ro_graph).unwrap();
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(1, 3), &clock)
+        .unwrap();
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let forged_commit = "a".repeat(40);
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": task_rev(&journal, "a") + 1,
+        "status": "succeeded",
+        "report": "read-only task tried claiming a commit",
+        "commit": forged_commit,
+        "artifacts": []
+    })
+    .to_string();
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let codex_report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(codex_report.status, ReconcileStatus::Blocked);
+    assert_eq!(codex_report.code, "invalid_output");
+    assert!(
+        codex_report.detail.contains("write_scope") || codex_report.detail.contains("commit"),
+        "{codex_report:?}"
+    );
+    assert_eq!(journal.view().tasks["a"].status, TaskStatus::Blocked);
+
+    journal
+        .retry_task(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "verify runner rejects empty write_scope commit",
+            &clock,
+        )
+        .unwrap();
+    let fake_adapter = FakeAdapter::available("fake").with_default(FakeBehavior::Succeed {
+        report: "forged commit from generic adapter".into(),
+        commit: Some("b".repeat(40)),
+        artifacts: Vec::new(),
+    });
+    let runner_report = run_task(
+        &mut journal,
+        &fake_adapter,
+        "a",
+        "fake-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(runner_report.status, ReconcileStatus::Blocked);
+    assert_eq!(runner_report.code, "invalid_worker_result");
+    assert!(
+        runner_report.detail.contains("write_scope") || runner_report.detail.contains("commit"),
+        "{runner_report:?}"
+    );
+    assert_eq!(journal.view().tasks["a"].status, TaskStatus::Blocked);
+}
+
+#[test]
 #[ignore]
 fn codex_live_smoke() {
     let fixture = Fixture::new();

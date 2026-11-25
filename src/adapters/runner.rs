@@ -584,6 +584,9 @@ pub(super) fn validate_worker_result(
     if result.task_revision != dispatch.packet.task.revision {
         return Err("stale worker result task_revision differs from dispatched attempt".to_owned());
     }
+    if dispatch.packet.task.spec.write_scope.is_empty() && result.commit.is_some() {
+        return Err("read-only task with empty write_scope must not report a commit".to_owned());
+    }
     Ok(())
 }
 
