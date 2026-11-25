@@ -2643,6 +2643,141 @@ fn codex_adapter_rejects_stale_git_worktree_base_before_promotion() {
     assert_eq!(run_git(&stale_wt, &["rev-parse", "HEAD"]), stale_head);
 }
 
+#[cfg(unix)]
+#[test]
+fn codex_adapter_does_not_collapse_unicode_nfc_and_nfd_scope_paths() {
+    let fixture = Fixture::new();
+    let workdir = fixture.root.join("worktrees/wt-unicode-norm");
+    // Declared scope uses NFC precomposed `é`, whereas disk contains NFD `e\u{0301}`.
+    fs::create_dir_all(workdir.join("cafe\u{0301}")).unwrap();
+    fs::write(
+        workdir.join("cafe\u{0301}/secret.txt"),
+        "nfd secret sibling\n",
+    )
+    .unwrap();
+    fs::create_dir_all(workdir.join("caf\u{00e9}")).unwrap();
+    fs::write(workdir.join("caf\u{00e9}/ok.txt"), "nfc allowed\n").unwrap();
+
+    let mut ctx = fixture.context.clone();
+    ctx.scope = vec!["caf\u{00e9}".into()];
+    let norm_spec = TaskSpec {
+        id: "a".into(),
+        story: STORY.into(),
+        prerequisites: Vec::new(),
+        stage: TaskStage::Plan,
+        read_scope: vec!["caf\u{00e9}".into()],
+        write_scope: vec!["caf\u{00e9}/out.txt".into()],
+        acceptance_criteria: vec!["AC1 verified".into()],
+        decision_owner: "orchestrator".into(),
+    };
+    let norm_graph = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: "1".repeat(40),
+        story_revision: 0,
+        stage: TaskStage::Plan,
+        tasks: vec![norm_spec],
+    };
+
+    let clock = FakeClock::at(100);
+    let mut journal = TaskJournal::open(&fixture.root, ctx).unwrap();
+    journal.initialize(norm_graph).unwrap();
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(1, 5), &clock)
+        .unwrap();
+
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+
+    // Unconfined runner must refuse the NFD sibling as outside NFC `read_scope`.
+    let unconfined = Arc::new(
+        MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_read_root_confinement(false),
+    );
+    for _ in 0..2 {
+        unconfined.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        unconfined.push_ok(0, sandbox_help, "", false, false);
+    }
+    let cancel = CancelToken::new();
+    let unconfined_adapter =
+        CodexAdapter::with_runner(CodexAdapterConfig::default(), unconfined.clone());
+    let refused = run_task(
+        &mut journal,
+        &unconfined_adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(refused.status, ReconcileStatus::HostUnavailable);
+    assert!(refused.detail.contains("cafe\u{0301}"), "{refused:?}");
+    assert!(unconfined.observed_exec_paths().is_empty());
+
+    // Confined runner stages only the exact NFC spelling and blocks writing NFD sibling.
+    journal
+        .retry_task(
+            journal.view().revision.unwrap(),
+            "a",
+            task_rev(&journal, "a"),
+            "retry with confined runner",
+            &clock,
+        )
+        .unwrap();
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": task_rev(&journal, "a") + 1,
+        "status": "succeeded",
+        "report": "attempted NFD write",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.set_workspace_mutation("cafe\u{0301}/out.txt", "nfd leak\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
+    let blocked = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(blocked.status, ReconcileStatus::Blocked);
+    assert_eq!(blocked.code, "invalid_output");
+    let seen = runner.observed_exec_paths();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0].contains(&"caf\u{00e9}/ok.txt".to_owned()),
+        "{:?}",
+        seen[0]
+    );
+    assert!(
+        !seen[0].iter().any(|p| p.contains("cafe\u{0301}")),
+        "NFD sibling must not be staged: {:?}",
+        seen[0]
+    );
+}
+
 #[test]
 #[ignore]
 fn codex_live_smoke() {

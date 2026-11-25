@@ -74,13 +74,13 @@ pub trait CodexCommandRunner: Send + Sync {
     /// Returns `true` only if the runner's OS containment guarantees that no
     /// detached descendant process can survive after termination is reported.
     fn has_unbroken_containment(&self) -> bool {
-        true
+        false
     }
 
     /// Returns `true` only if the runner strictly restricts filesystem reads
     /// to `staging_dir` (refusing full-filesystem reads outside `read_scope`).
     fn has_read_root_confinement(&self) -> bool {
-        true
+        false
     }
 
     /// Returns `true` if the host's ambient Codex config defines legacy
@@ -1124,8 +1124,7 @@ fn stage_read_scope(
     read_scope: &[String],
     max_bytes: usize,
 ) -> Result<(), StageError> {
-    let norm_scopes: Vec<String> = read_scope.iter().map(|s| nfc_path(s)).collect();
-    if norm_scopes.is_empty() {
+    if read_scope.is_empty() {
         return Ok(());
     }
     let mut copied_bytes = 0usize;
@@ -1134,7 +1133,7 @@ fn stage_read_scope(
         workdir,
         workdir,
         staging_root,
-        &norm_scopes,
+        read_scope,
         max_bytes,
         &mut copied_bytes,
         &mut dir_modes,
@@ -1149,7 +1148,7 @@ fn stage_dir_entries(
     workdir: &Path,
     dir: &Path,
     staging_root: &Path,
-    norm_scopes: &[String],
+    read_scope: &[String],
     max_bytes: usize,
     copied_bytes: &mut usize,
     dir_modes: &mut Vec<(PathBuf, u32)>,
@@ -1168,9 +1167,8 @@ fn stage_dir_entries(
         if rel_str.is_empty() || is_protected_path(&rel_str) {
             continue;
         }
-        let norm = nfc_path(&rel_str);
-        let in_read = norm_scopes.iter().any(|scope| within_path(&norm, scope));
-        let is_ancestor = norm_scopes.iter().any(|scope| within_path(scope, &norm));
+        let in_read = read_scope.iter().any(|scope| within_path(&rel_str, scope));
+        let is_ancestor = read_scope.iter().any(|scope| within_path(scope, &rel_str));
         if !in_read && !is_ancestor {
             continue;
         }
@@ -1189,7 +1187,7 @@ fn stage_dir_entries(
                 workdir,
                 &path,
                 staging_root,
-                norm_scopes,
+                read_scope,
                 max_bytes,
                 copied_bytes,
                 dir_modes,
@@ -1223,16 +1221,15 @@ fn stage_dir_entries(
 }
 
 fn find_unscoped_workdir_entries(workdir: &Path, read_scope: &[String]) -> io::Result<Vec<String>> {
-    let norm_scopes: Vec<String> = read_scope.iter().map(|s| nfc_path(s)).collect();
     let mut unscoped = Vec::new();
-    collect_unscoped_entries(workdir, workdir, &norm_scopes, &mut unscoped)?;
+    collect_unscoped_entries(workdir, workdir, read_scope, &mut unscoped)?;
     Ok(unscoped)
 }
 
 fn collect_unscoped_entries(
     workdir: &Path,
     dir: &Path,
-    norm_scopes: &[String],
+    read_scope: &[String],
     unscoped: &mut Vec<String>,
 ) -> io::Result<()> {
     const MAX_SAMPLE: usize = 16;
@@ -1254,13 +1251,12 @@ fn collect_unscoped_entries(
             unscoped.push(rel_str);
             continue;
         }
-        let norm = nfc_path(&rel_str);
-        let in_read = norm_scopes.iter().any(|scope| within_path(&norm, scope));
-        let is_ancestor = norm_scopes.iter().any(|scope| within_path(scope, &norm));
+        let in_read = read_scope.iter().any(|scope| within_path(&rel_str, scope));
+        let is_ancestor = read_scope.iter().any(|scope| within_path(scope, &rel_str));
         let meta = fs::symlink_metadata(&path)?;
         if meta.file_type().is_dir() {
             if in_read || is_ancestor {
-                collect_unscoped_entries(workdir, &path, norm_scopes, unscoped)?;
+                collect_unscoped_entries(workdir, &path, read_scope, unscoped)?;
             } else {
                 unscoped.push(rel_str);
             }
@@ -1342,15 +1338,10 @@ fn apply_staged_writes_with(
                 "refusing protected path promotion from staging: {path}"
             ));
         }
-        let norm_path = nfc_path(path);
-        let in_write_scope = write_scope
-            .iter()
-            .any(|scope| within_path(&norm_path, &nfc_path(scope)));
+        let in_write_scope = write_scope.iter().any(|scope| within_path(path, scope));
         let created_parent_for_scope = prev.is_none()
             && matches!(curr, Some(SnapshotEntry::Dir { .. }))
-            && write_scope
-                .iter()
-                .any(|scope| within_path(&nfc_path(scope), &norm_path));
+            && write_scope.iter().any(|scope| within_path(scope, path));
         if !in_write_scope && !created_parent_for_scope {
             return Err(format!(
                 "refusing out-of-scope promotion from staging: {path}"
@@ -2468,15 +2459,10 @@ fn verify_and_restore_post_run(
             violations.push(path.clone());
             continue;
         }
-        let norm_path = nfc_path(path);
-        let in_write_scope = write_scope
-            .iter()
-            .any(|scope| within_path(&norm_path, &nfc_path(scope)));
+        let in_write_scope = write_scope.iter().any(|scope| within_path(path, scope));
         let created_parent_for_scope = prev.is_none()
             && matches!(curr, Some(SnapshotEntry::Dir { .. }))
-            && write_scope
-                .iter()
-                .any(|scope| within_path(&nfc_path(scope), &norm_path));
+            && write_scope.iter().any(|scope| within_path(scope, path));
         if !in_write_scope && !created_parent_for_scope {
             violations.push(path.clone());
         }
@@ -2797,10 +2783,6 @@ fn rel_path_utf8(rel: &Path) -> io::Result<String> {
     Ok(parts.join("/"))
 }
 
-fn nfc_path(value: &str) -> String {
-    value.nfc().collect()
-}
-
 fn fold_path(value: &str) -> String {
     value.nfc().flat_map(char::to_lowercase).collect()
 }
@@ -3013,5 +2995,28 @@ mod tests {
         assert!(config_toml_sets_legacy_sandbox(
             "unrecognized syntax here\n"
         ));
+    }
+
+    #[test]
+    fn minimal_runner_defaults_reject_unverified_confinement_and_containment() {
+        struct MinimalRunner;
+        impl CodexCommandRunner for MinimalRunner {
+            fn resolve_executable(&self, _configured: Option<&Path>) -> Result<PathBuf, String> {
+                Ok(PathBuf::from("codex"))
+            }
+
+            fn run(
+                &self,
+                _spec: &HostCommandSpec,
+                _cwd: &Path,
+                _should_stop: &dyn Fn() -> bool,
+            ) -> Result<ControlledResult, ProcessError> {
+                unreachable!()
+            }
+        }
+
+        let runner = MinimalRunner;
+        assert!(!runner.has_unbroken_containment());
+        assert!(!runner.has_read_root_confinement());
     }
 }
