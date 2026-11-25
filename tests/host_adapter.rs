@@ -3576,6 +3576,144 @@ fn codex_adapter_accepts_large_valid_last_message_with_64_artifacts() {
 }
 
 #[test]
+fn codex_adapter_includes_bounded_prerequisite_reports_in_prompt() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-prereq-reports");
+    fs::write(workdir.join("app/input.txt"), "allowed input\n").unwrap();
+
+    let mut ctx = fixture.context.clone();
+    ctx.scope = vec!["app".into()];
+    let mut spec_a = spec("a", &[]);
+    spec_a.write_scope = vec!["app/a.txt".into()];
+    let mut spec_b = spec("b", &[]);
+    spec_b.write_scope = vec!["app/b.txt".into()];
+    let mut spec_c = spec("c", &["a", "b"]);
+    spec_c.write_scope = Vec::new();
+    let dag = TaskGraph {
+        schema: 1,
+        story: STORY.into(),
+        base: "1".repeat(40),
+        story_revision: 0,
+        stage: TaskStage::Plan,
+        tasks: vec![spec_a, spec_b, spec_c],
+    };
+
+    let clock = FakeClock::at(100);
+    let mut journal = TaskJournal::open(&fixture.root, ctx).unwrap();
+    journal.initialize(dag).unwrap();
+    journal
+        .configure_scheduler(journal.view().revision.unwrap(), policy(2, 2), &clock)
+        .unwrap();
+
+    let long_report = format!("UPSTREAM_LONG_{}", "R".repeat(700));
+    let upstream_adapter = FakeAdapter::available("fake").with_default(FakeBehavior::Custom(
+        Arc::new(move |req, _| {
+            let task = &req.dispatch.packet.task.spec.id;
+            let (report, artifacts) = if task == "a" {
+                (
+                    "Decision: keep JWT\nrotation enabled".to_owned(),
+                    vec![storyflow::tasks::Artifact {
+                        path: "app/design.md".to_owned(),
+                        sha256: "a".repeat(64),
+                    }],
+                )
+            } else {
+                (long_report.clone(), Vec::new())
+            };
+            AdapterOutcome::Completed {
+                correlation: SessionCorrelation::from_lease(&req.dispatch.lease, "fake-sess"),
+                result: storyflow::tasks::WorkerResult {
+                    schema: storyflow::tasks::SCHEMA,
+                    story: req.dispatch.packet.story.clone(),
+                    task: task.clone(),
+                    task_revision: req.dispatch.packet.task.revision,
+                    status: storyflow::tasks::ResultStatus::Succeeded,
+                    report,
+                    commit: Some("c".repeat(40)),
+                    artifacts,
+                },
+                worker_stopped: true,
+            }
+        }),
+    ));
+    let cancel = CancelToken::new();
+    for dep in ["a", "b"] {
+        let rep = run_task(
+            &mut journal,
+            &upstream_adapter,
+            dep,
+            "fake-host",
+            &workdir,
+            ExecutionPolicy::WorkspaceWrite,
+            &cancel,
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(rep.status, ReconcileStatus::Applied, "{rep:?}");
+    }
+
+    let full_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))));
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, full_help, "", false, false);
+    }
+    let trev_c = task_rev(&journal, "c");
+    let c_result_json = json!({
+        "story": STORY,
+        "task": "c",
+        "task_revision": trev_c + 1,
+        "status": "succeeded",
+        "report": "used upstream context",
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&c_result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let codex_adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
+    let rep_c = run_task(
+        &mut journal,
+        &codex_adapter,
+        "c",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(rep_c.status, ReconcileStatus::Applied, "{rep_c:?}");
+
+    let exec_call = runner.calls().pop().unwrap();
+    let prompt_bytes = exec_call.stdin.expect("stdin prompt");
+    assert!(prompt_bytes.len() <= 65_536);
+    let prompt = std::str::from_utf8(&prompt_bytes).unwrap();
+    assert!(prompt.contains("Completed prerequisites:\n"), "{prompt}");
+    assert!(
+        prompt.contains("Decision: keep JWT rotation enabled"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("app/design.md (aaaaaaaaaaaa)"), "{prompt}");
+    assert!(prompt.contains("UPSTREAM_LONG_"), "{prompt}");
+    assert!(prompt.contains("..."), "{prompt}");
+    assert!(
+        !prompt.contains(&"R".repeat(700)),
+        "oversized prerequisite report must be truncated"
+    );
+    assert!(prompt.contains("\nConstraints:\n"), "{prompt}");
+}
+
+#[test]
 #[ignore]
 fn codex_live_smoke() {
     let fixture = Fixture::new();

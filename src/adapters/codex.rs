@@ -994,6 +994,24 @@ fn extract_message_from_stdout(stdout: &str, json_output: bool) -> Option<String
     }
 }
 
+fn format_prereq_summary(report: &str, max_bytes: usize) -> String {
+    let cleaned: String = report
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let normalized = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.len() <= max_bytes {
+        return normalized;
+    }
+    let mut end = max_bytes.saturating_sub(3);
+    while !normalized.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = normalized[..end].to_owned();
+    out.push_str("...");
+    out
+}
+
 fn build_prompt(request: &AdapterRequest) -> AdapterResult<String> {
     let packet = &request.dispatch.packet;
     let task = &packet.task;
@@ -1046,13 +1064,36 @@ fn build_prompt(request: &AdapterRequest) -> AdapterResult<String> {
 
     let mut prereqs = String::new();
     if !packet.prerequisites.is_empty() {
+        const MAX_PREREQ_REPORT_BYTES: usize = 512;
+        const MAX_PREREQ_ARTIFACTS: usize = 8;
         prereqs.push_str("Completed prerequisites:\n");
         for (dep_id, dep_res) in &packet.prerequisites {
+            let summary = format_prereq_summary(&dep_res.report, MAX_PREREQ_REPORT_BYTES);
             prereqs.push_str(&format!(
-                "- {dep_id}: {:?} ({})\n",
+                "- {dep_id}: {:?} ({}) — {summary}\n",
                 dep_res.status,
-                dep_res.commit.as_deref().unwrap_or("no-commit")
+                dep_res.commit.as_deref().unwrap_or("no-commit"),
             ));
+            if !dep_res.artifacts.is_empty() {
+                let shown: Vec<String> = dep_res
+                    .artifacts
+                    .iter()
+                    .take(MAX_PREREQ_ARTIFACTS)
+                    .map(|art| {
+                        let short_sha: String = art.sha256.chars().take(12).collect();
+                        format!("{} ({short_sha})", art.path)
+                    })
+                    .collect();
+                prereqs.push_str("  artifacts: ");
+                prereqs.push_str(&shown.join(", "));
+                if dep_res.artifacts.len() > MAX_PREREQ_ARTIFACTS {
+                    prereqs.push_str(&format!(
+                        ", ... (+{} more)",
+                        dep_res.artifacts.len() - MAX_PREREQ_ARTIFACTS
+                    ));
+                }
+                prereqs.push('\n');
+            }
         }
         let prereq_budget = MAX_PROMPT_BYTES - required_body.len() - constraints.len();
         if prereqs.len() > prereq_budget {
