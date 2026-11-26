@@ -441,6 +441,20 @@ pub fn sanitize_reason_with_secrets(input: &str, secret_values: &[&str]) -> Stri
     }
 }
 
+fn valid_bounded_text(value: &str, max_bytes: usize, code: &'static str) -> AdapterResult<()> {
+    if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(AdapterError::new(
+            code,
+            "value must be non-blank, bounded, and free of control characters",
+        ));
+    }
+    Ok(())
+}
+
+pub use codex::{CodexAdapter, CodexAdapterConfig};
+pub use fake::{FakeAdapter, FakeBehavior};
+pub use runner::{ReconcileReport, ReconcileStatus, dispatch_and_run, reconcile_outcome};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,17 +473,3 @@ mod tests {
         assert!(redacted.contains("[REDACTED]"), "{redacted}");
     }
 }
-
-fn valid_bounded_text(value: &str, max_bytes: usize, code: &'static str) -> AdapterResult<()> {
-    if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
-        return Err(AdapterError::new(
-            code,
-            "value must be non-blank, bounded, and free of control characters",
-        ));
-    }
-    Ok(())
-}
-
-pub use codex::{CodexAdapter, CodexAdapterConfig};
-pub use fake::{FakeAdapter, FakeBehavior};
-pub use runner::{ReconcileReport, ReconcileStatus, dispatch_and_run, reconcile_outcome};
