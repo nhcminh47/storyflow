@@ -4138,6 +4138,112 @@ fn runner_reconcile_redacts_pattern_secrets_from_fake_adapter_report() {
 }
 
 #[test]
+fn codex_adapter_rejects_artifact_path_containing_configured_secret() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-artifact-secret");
+    fs::write(workdir.join("app/input.txt"), "allowed input\n").unwrap();
+
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let sentinel_key = "sentinel-artifact-key-778899";
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(
+        MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_env("OPENAI_API_KEY", sentinel_key),
+    );
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let trev = task_rev(&journal, "a");
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": trev + 1,
+        "status": "succeeded",
+        "report": "completed cleanly",
+        "commit": null,
+        "artifacts": [{
+            "path": format!("app/{sentinel_key}.txt"),
+            "sha256": "a".repeat(64)
+        }]
+    })
+    .to_string();
+    runner.set_workspace_mutation("app/a.txt", "should not be promoted\n");
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::WorkspaceWrite,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ReconcileStatus::Blocked, "{report:?}");
+    assert_eq!(report.code, "invalid_output");
+    assert!(report.worker_stopped);
+    assert!(!report.detail.contains(sentinel_key), "{report:?}");
+    assert!(journal.view().tasks["a"].result.is_none());
+    assert!(
+        !workdir.join("app/a.txt").exists(),
+        "rejected artifact secret must block workspace write promotion"
+    );
+    assert_dir_absent_string(&fixture.story_events_dir(), sentinel_key);
+}
+
+#[test]
+fn runner_reconcile_rejects_artifact_path_containing_credential_pattern() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-fake-artifact-secret");
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let pattern_key = "sk-live-secret1234567890";
+    let adapter = FakeAdapter::available("fake").with_default(FakeBehavior::Succeed {
+        report: "completed cleanly".to_owned(),
+        commit: None,
+        artifacts: vec![Artifact {
+            path: format!("out/{pattern_key}.log"),
+            sha256: "b".repeat(64),
+        }],
+    });
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "fake-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ReconcileStatus::Blocked, "{report:?}");
+    assert_eq!(report.code, "invalid_worker_result");
+    assert!(!report.detail.contains(pattern_key), "{report:?}");
+    assert!(journal.view().tasks["a"].result.is_none());
+    assert_dir_absent_string(&fixture.story_events_dir(), pattern_key);
+}
+
+#[test]
 #[ignore]
 fn codex_live_smoke() {
     let fixture = Fixture::new();

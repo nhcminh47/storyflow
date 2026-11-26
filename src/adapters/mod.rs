@@ -400,6 +400,12 @@ fn redact_patterns(input: &str) -> String {
     out
 }
 
+/// Returns `true` when `input` contains a configured secret value or a
+/// recognized credential pattern.
+pub(crate) fn contains_secret(input: &str, secret_values: &[&str]) -> bool {
+    redact_secrets(input, secret_values) != input
+}
+
 /// Redact configured secret values and credential patterns from a worker report.
 /// Preserves oversized inputs so `WorkerResult::validate()` still rejects them;
 /// if redaction expands a valid-sized report past `MAX_REPORT_BYTES`, truncates

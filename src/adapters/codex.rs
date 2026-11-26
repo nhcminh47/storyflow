@@ -2,7 +2,7 @@
 use super::{
     ADAPTER_SCHEMA, AdapterError, AdapterOutcome, AdapterRequest, AdapterResult, CancelToken,
     ExecutionPolicy, HostAdapter, HostCapabilities, MAX_SESSION_ID_BYTES, SessionCorrelation,
-    redact_report, redact_secrets, sanitize_reason_with_secrets,
+    contains_secret, redact_report, redact_secrets, sanitize_reason_with_secrets,
 };
 use crate::{
     config::BUILTIN_PROTECTED,
@@ -803,6 +803,18 @@ impl HostAdapter for CodexAdapter {
             commit: envelope.commit,
             artifacts: envelope.artifacts,
         };
+        if result
+            .artifacts
+            .iter()
+            .any(|artifact| contains_secret(&artifact.path, &secret_refs))
+        {
+            return AdapterOutcome::InvalidOutput {
+                correlation,
+                worker_stopped,
+                detail: "codex worker result artifact path contains secret or credential material"
+                    .to_owned(),
+            };
+        }
         if let Err(err) = super::runner::validate_worker_result(&result, &request.dispatch) {
             return AdapterOutcome::InvalidOutput {
                 correlation,

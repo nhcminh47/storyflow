@@ -606,6 +606,15 @@ pub(super) fn validate_worker_result(
     if dispatch.packet.task.spec.write_scope.is_empty() && result.commit.is_some() {
         return Err("read-only task with empty write_scope must not report a commit".to_owned());
     }
+    if result
+        .artifacts
+        .iter()
+        .any(|artifact| super::contains_secret(&artifact.path, &[]))
+    {
+        return Err(
+            "worker result artifact path contains secret or credential material".to_owned(),
+        );
+    }
     Ok(())
 }
 
