@@ -8,7 +8,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use storyflow::security::process::{CommandSpec, MAX_OUTPUT_BYTES, configure_environment, run};
+use storyflow::security::process::{
+    CommandSpec, MAX_OUTPUT_BYTES, configure_environment, run, run_controlled,
+};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Fixture(PathBuf);
@@ -370,4 +372,30 @@ fn msvc_installation_discovery_survives_environment_filtering() {
         String::from_utf8_lossy(&original.stdout).trim(),
         "filtered MSVC discovery lost its installation"
     );
+}
+
+#[test]
+fn run_controlled_pre_cancelled_never_launches_process() {
+    let fixture = Fixture::new("environment");
+    let result = run_controlled(&fixture.spec(Duration::from_secs(5)), &fixture.0, || true)
+        .expect("pre-cancelled run should return Ok");
+    assert!(result.cancelled);
+    assert!(!result.process.timed_out);
+    assert!(result.process.status.is_none());
+    assert!(result.process.stdout.is_empty());
+    assert!(result.process.stderr.is_empty());
+}
+
+#[test]
+fn run_controlled_cancellation_kills_child_and_grandchild() {
+    let fixture = Fixture::new("timeout");
+    let ready_path = fixture.0.join("ready");
+    let result = run_controlled(&fixture.spec(Duration::from_secs(10)), &fixture.0, || {
+        ready_path.exists()
+    })
+    .expect("cancelled tree should clean up cleanly");
+    assert!(result.cancelled);
+    assert!(!result.process.timed_out);
+    assert!(ready_path.exists());
+    assert_descendants_stopped(&fixture);
 }

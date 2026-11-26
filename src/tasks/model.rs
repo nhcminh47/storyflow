@@ -265,7 +265,7 @@ pub struct WorkerResult {
     pub artifacts: Vec<Artifact>,
 }
 impl WorkerResult {
-    pub(crate) fn validate(&self) -> TaskResult<()> {
+    pub fn validate(&self) -> TaskResult<()> {
         require(
             self.schema == SCHEMA,
             "task_schema",
