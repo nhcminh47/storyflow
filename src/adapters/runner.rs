@@ -4,7 +4,7 @@
 //! journals, bypass quality gates, or self-certify completion.
 use super::{
     ADAPTER_SCHEMA, AdapterOutcome, AdapterRequest, CancelToken, ExecutionPolicy, HostAdapter,
-    SessionCorrelation, sanitize_reason,
+    SessionCorrelation, redact_report, sanitize_reason,
 };
 use crate::tasks::{
     AttemptPhase, AttemptResult, Clock, DispatchPacket, ResultStatus, SCHEMA, TaskJournal,
@@ -78,9 +78,11 @@ pub fn dispatch_and_run(
         return Ok(ReconcileReport {
             status: ReconcileStatus::HostUnavailable,
             code: "host_unavailable".to_owned(),
-            detail: caps
-                .unavailable_reason
-                .unwrap_or_else(|| format!("host '{}' is unavailable", adapter.provider())),
+            detail: sanitize_reason(
+                &caps
+                    .unavailable_reason
+                    .unwrap_or_else(|| format!("host '{}' is unavailable", adapter.provider())),
+            ),
             task: task.to_owned(),
             attempt_id: None,
             session_id: None,
@@ -374,7 +376,7 @@ pub fn reconcile_outcome(
 
     match outcome {
         AdapterOutcome::Completed {
-            result,
+            mut result,
             worker_stopped,
             ..
         } => {
@@ -388,6 +390,7 @@ pub fn reconcile_outcome(
                     Some(rev),
                 ));
             }
+            result.report = redact_report(&result.report, &[]);
             if let Err(err) = validate_worker_result(&result, dispatch) {
                 let reason = sanitize_reason(&err);
                 journal.confirm_stopped(rev, &dispatch.lease, &reason, clock)?;

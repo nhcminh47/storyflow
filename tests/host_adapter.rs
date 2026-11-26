@@ -1,5 +1,6 @@
 use serde_json::json;
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     process::ExitStatus,
@@ -193,6 +194,7 @@ struct MockCodexRunner {
     unbroken_containment: bool,
     read_root_confinement: bool,
     ambient_legacy_sandbox: bool,
+    env: Mutex<BTreeMap<String, String>>,
 }
 
 impl MockCodexRunner {
@@ -211,6 +213,7 @@ impl MockCodexRunner {
             unbroken_containment: true,
             read_root_confinement: true,
             ambient_legacy_sandbox: false,
+            env: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -226,6 +229,14 @@ impl MockCodexRunner {
 
     fn with_ambient_legacy_sandbox(mut self, ambient: bool) -> Self {
         self.ambient_legacy_sandbox = ambient;
+        self
+    }
+
+    fn with_env(self, key: &str, value: &str) -> Self {
+        self.env
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), value.to_owned());
         self
     }
 
@@ -395,6 +406,10 @@ impl CodexCommandRunner for MockCodexRunner {
 
     fn ambient_config_sets_legacy_sandbox(&self) -> bool {
         self.ambient_legacy_sandbox
+    }
+
+    fn read_env(&self, key: &str) -> Option<String> {
+        self.env.lock().unwrap().get(key).cloned()
     }
 }
 
@@ -1938,7 +1953,7 @@ fn codex_adapter_recovers_unreadable_post_run_mutations() {
 }
 
 #[test]
-fn codex_adapter_reports_unstopped_when_containment_is_escapable() {
+fn codex_adapter_fails_closed_before_dispatch_when_containment_is_escapable() {
     assert_eq!(
         ProcessCommandRunner.has_unbroken_containment(),
         cfg!(windows)
@@ -1955,32 +1970,17 @@ fn codex_adapter_reports_unstopped_when_containment_is_escapable() {
         runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
         runner.push_ok(0, sandbox_help, "", false, false);
     }
-    let result_json = json!({
-        "story": STORY,
-        "task": "a",
-        "task_revision": 1,
-        "status": "succeeded",
-        "report": "completed while descendants unconfirmed",
-        "commit": null,
-        "artifacts": []
-    })
-    .to_string();
-    runner.set_workspace_mutation("app/a.txt", "should not be promoted\n");
-    runner.push_ok(
-        0,
-        &format!(
-            "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
-            serde_json::to_string(&result_json).unwrap()
-        ),
-        "",
-        false,
-        false,
-    );
 
-    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner.clone());
     let caps = adapter.probe();
-    assert!(caps.available);
+    assert!(!caps.available);
     assert!(!caps.supports_cancel);
+    assert!(
+        caps.unavailable_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("containment")),
+        "{caps:?}"
+    );
 
     let cancel = CancelToken::new();
     let report = run_task(
@@ -1994,12 +1994,52 @@ fn codex_adapter_reports_unstopped_when_containment_is_escapable() {
         &clock,
     )
     .unwrap();
-    assert_eq!(report.status, ReconcileStatus::BlockedUnstopped);
-    assert!(!report.worker_stopped);
-    assert!(!report.recoverable);
+    assert_eq!(report.status, ReconcileStatus::HostUnavailable);
+    assert!(report.attempt_id.is_none());
+    assert!(report.worker_stopped);
+    assert!(report.recoverable);
+    assert_eq!(journal.scheduler_status(&clock).unwrap().active_attempts, 0);
+    assert_eq!(journal.view().tasks["a"].status, TaskStatus::Ready);
+    assert!(
+        journal
+            .view()
+            .scheduler
+            .as_ref()
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+
+    // Direct execute() without runner pre-probe also fails closed without spawning codex exec.
+    let trev = task_rev(&journal, "a");
+    let dispatch = journal
+        .dispatch(
+            journal.view().revision.unwrap(),
+            "a",
+            trev,
+            "direct-exec",
+            &clock,
+        )
+        .unwrap();
+    let direct_request = AdapterRequest {
+        schema: ADAPTER_SCHEMA,
+        dispatch,
+        workdir: workdir.clone(),
+        timeout_ms: 10_000,
+        policy: ExecutionPolicy::WorkspaceWrite,
+    };
+    let direct_outcome = adapter.execute(&direct_request, &cancel);
+    assert!(
+        matches!(direct_outcome, AdapterOutcome::HostUnavailable { .. }),
+        "{direct_outcome:?}"
+    );
+    assert!(
+        runner.observed_exec_paths().is_empty(),
+        "codex exec must never run when containment is escapable"
+    );
     assert!(
         !workdir.join("app/a.txt").exists(),
-        "unconfirmed worker writes must not be promoted to workdir"
+        "escapable runner must never write to workdir"
     );
 }
 
@@ -3261,7 +3301,7 @@ fn non_completed_outcomes_reject_invalid_session_ids() {
 }
 
 #[test]
-fn codex_adapter_treats_pre_launch_cancellation_as_stopped_without_containment() {
+fn codex_adapter_treats_pre_launch_cancellation_as_stopped() {
     let fixture = Fixture::new();
     let workdir = fixture.isolated_workdir("wt-prelaunch-cancel");
     fs::write(workdir.join("app/input.txt"), "allowed input\n").unwrap();
@@ -3270,7 +3310,7 @@ fn codex_adapter_treats_pre_launch_cancellation_as_stopped_without_containment()
     let mut journal = fixture.configured(policy(1, 2), &clock);
 
     let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
-    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_containment(false));
+    let runner = Arc::new(MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_containment(true));
     for _ in 0..2 {
         runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
         runner.push_ok(0, sandbox_help, "", false, false);
@@ -3838,6 +3878,263 @@ fn codex_adapter_rejects_hard_linked_files_at_scope_boundaries() {
         "secret-body\n",
         "hard-linked out-of-scope alias must remain untouched"
     );
+}
+
+fn assert_dir_absent_string(root: &Path, needle: &str) {
+    if !root.exists() {
+        return;
+    }
+    for entry in fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_dir() {
+            assert_dir_absent_string(&path, needle);
+        } else {
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(
+                !content.contains(needle),
+                "unexpected secret {needle:?} persisted in {}: {content}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_default_process_runner_containment_contract() {
+    assert_eq!(
+        ProcessCommandRunner.has_unbroken_containment(),
+        cfg!(windows)
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let workdir = fixture.isolated_workdir("wt-default-unix-probe");
+        let clock = FakeClock::at(100);
+        let mut journal = fixture.configured(policy(1, 2), &clock);
+
+        let fake_codex = fixture.root.join("fake-codex");
+        fs::write(
+            &fake_codex,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               echo \"codex-cli 0.55.0\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"--help\" ]; then\n\
+               echo \"Usage: codex exec --cd <DIR> --sandbox <MODE> --config <KEY=VALUE> --json - [PROMPT]\"\n\
+               exit 0\n\
+             fi\n\
+             echo \"unexpected invocation\" >&2\n\
+             exit 99\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_codex).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_codex, perms).unwrap();
+
+        let adapter = CodexAdapter::with_config(CodexAdapterConfig {
+            executable: Some(fake_codex),
+            ..Default::default()
+        });
+        let caps = adapter.probe();
+        assert!(!caps.available, "{caps:?}");
+        assert!(!caps.supports_cancel, "{caps:?}");
+        assert!(caps.supports_sandbox_flag, "{caps:?}");
+        assert!(
+            caps.unavailable_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("containment")),
+            "{caps:?}"
+        );
+
+        let cancel = CancelToken::new();
+        let report = run_task(
+            &mut journal,
+            &adapter,
+            "a",
+            "codex-host",
+            &workdir,
+            ExecutionPolicy::ReadOnly,
+            &cancel,
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(
+            report.status,
+            ReconcileStatus::HostUnavailable,
+            "{report:?}"
+        );
+        assert!(report.attempt_id.is_none());
+        assert_eq!(journal.scheduler_status(&clock).unwrap().active_attempts, 0);
+    }
+}
+
+#[test]
+fn codex_adapter_redacts_configured_secret_from_report_and_journal() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-redact-report");
+    fs::write(workdir.join("app/input.txt"), "allowed input\n").unwrap();
+
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let sentinel_key = "sentinel-opaque-api-key-987654321";
+    let pattern_key = "sk-proj-1234567890abcdef";
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(
+        MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_env("OPENAI_API_KEY", sentinel_key),
+    );
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    let trev = task_rev(&journal, "a");
+    let result_json = json!({
+        "story": STORY,
+        "task": "a",
+        "task_revision": trev + 1,
+        "status": "succeeded",
+        "report": format!("finished with key {sentinel_key} and {pattern_key}"),
+        "commit": null,
+        "artifacts": []
+    })
+    .to_string();
+    runner.push_ok(
+        0,
+        &format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"thread_{sentinel_key}\"}}\n\
+             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":{}}}}}\n",
+            serde_json::to_string(&result_json).unwrap()
+        ),
+        "",
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ReconcileStatus::Applied, "{report:?}");
+    assert!(!report.detail.contains(sentinel_key), "{report:?}");
+    assert!(!report.detail.contains(pattern_key), "{report:?}");
+    assert!(report.detail.contains("[REDACTED]"), "{report:?}");
+    assert!(
+        report
+            .session_id
+            .as_deref()
+            .is_none_or(|s| !s.contains(sentinel_key)),
+        "{report:?}"
+    );
+
+    let saved_report = &journal.view().tasks["a"].result.as_ref().unwrap().report;
+    assert!(!saved_report.contains(sentinel_key), "{saved_report}");
+    assert!(!saved_report.contains(pattern_key), "{saved_report}");
+    assert!(saved_report.contains("[REDACTED]"), "{saved_report}");
+
+    assert_dir_absent_string(&fixture.story_events_dir(), sentinel_key);
+    assert_dir_absent_string(&fixture.story_events_dir(), pattern_key);
+}
+
+#[test]
+fn codex_adapter_redacts_configured_secret_from_stderr_and_error_journal() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-redact-stderr");
+    fs::write(workdir.join("app/input.txt"), "allowed input\n").unwrap();
+
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let sentinel_key = "sentinel-stderr-key-abcdef123456";
+    let bearer_tok = "super_secret_token_99";
+    let sandbox_help = "Usage: codex exec --cd <DIR> --sandbox <MODE> --json - [PROMPT]\n";
+    let runner = Arc::new(
+        MockCodexRunner::new(Ok(PathBuf::from("codex"))).with_env("OPENAI_API_KEY", sentinel_key),
+    );
+    for _ in 0..2 {
+        runner.push_ok(0, "codex-cli 0.55.0\n", "", false, false);
+        runner.push_ok(0, sandbox_help, "", false, false);
+    }
+    runner.push_ok(
+        1,
+        "",
+        &format!("request failed with {sentinel_key} and Authorization: Bearer {bearer_tok}"),
+        false,
+        false,
+    );
+
+    let adapter = CodexAdapter::with_runner(CodexAdapterConfig::default(), runner);
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "codex-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ReconcileStatus::Blocked, "{report:?}");
+    assert_eq!(report.code, "host_crashed");
+    assert!(!report.detail.contains(sentinel_key), "{report:?}");
+    assert!(!report.detail.contains(bearer_tok), "{report:?}");
+    assert!(report.detail.contains("[REDACTED]"), "{report:?}");
+
+    assert_dir_absent_string(&fixture.story_events_dir(), sentinel_key);
+    assert_dir_absent_string(&fixture.story_events_dir(), bearer_tok);
+}
+
+#[test]
+fn runner_reconcile_redacts_pattern_secrets_from_fake_adapter_report() {
+    let fixture = Fixture::new();
+    let workdir = fixture.isolated_workdir("wt-fake-redact");
+    let clock = FakeClock::at(100);
+    let mut journal = fixture.configured(policy(1, 2), &clock);
+
+    let pattern_key = "sk-live-secret1234567890";
+    let raw_assign = "raw_secret_value_xyz";
+    let adapter = FakeAdapter::available("fake").with_default(FakeBehavior::Succeed {
+        report: format!("completed with {pattern_key} and OPENAI_API_KEY={raw_assign}"),
+        commit: None,
+        artifacts: Vec::new(),
+    });
+    let cancel = CancelToken::new();
+    let report = run_task(
+        &mut journal,
+        &adapter,
+        "a",
+        "fake-host",
+        &workdir,
+        ExecutionPolicy::ReadOnly,
+        &cancel,
+        &clock,
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ReconcileStatus::Applied, "{report:?}");
+    assert!(!report.detail.contains(pattern_key), "{report:?}");
+    assert!(!report.detail.contains(raw_assign), "{report:?}");
+    assert!(report.detail.contains("[REDACTED]"), "{report:?}");
+
+    assert_dir_absent_string(&fixture.story_events_dir(), pattern_key);
+    assert_dir_absent_string(&fixture.story_events_dir(), raw_assign);
 }
 
 #[test]

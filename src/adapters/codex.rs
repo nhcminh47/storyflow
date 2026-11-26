@@ -2,7 +2,7 @@
 use super::{
     ADAPTER_SCHEMA, AdapterError, AdapterOutcome, AdapterRequest, AdapterResult, CancelToken,
     ExecutionPolicy, HostAdapter, HostCapabilities, MAX_SESSION_ID_BYTES, SessionCorrelation,
-    sanitize_reason,
+    redact_report, redact_secrets, sanitize_reason_with_secrets,
 };
 use crate::{
     config::BUILTIN_PROTECTED,
@@ -87,6 +87,11 @@ pub trait CodexCommandRunner: Send + Sync {
     /// `sandbox_mode` or `sandbox_workspace_write` keys that override `default_permissions`.
     fn ambient_config_sets_legacy_sandbox(&self) -> bool {
         false
+    }
+
+    /// Reads an environment variable value for secret redaction.
+    fn read_env(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok()
     }
 }
 
@@ -258,6 +263,31 @@ impl CodexAdapter {
     pub fn with_runner(config: CodexAdapterConfig, runner: Arc<dyn CodexCommandRunner>) -> Self {
         Self { config, runner }
     }
+
+    fn configured_secret_values(&self) -> Vec<String> {
+        self.config
+            .passthrough_env
+            .iter()
+            .filter(|key| is_secret_env_name(key))
+            .filter_map(|key| self.runner.read_env(key))
+            .filter(|val| !val.trim().is_empty())
+            .collect()
+    }
+}
+
+fn is_secret_env_name(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "AUTH",
+    ]
+    .iter()
+    .any(|marker| upper.contains(marker))
 }
 
 impl HostAdapter for CodexAdapter {
@@ -269,6 +299,8 @@ impl HostAdapter for CodexAdapter {
         if let Err(err) = self.config.validate() {
             return HostCapabilities::unavailable("codex", err.to_string());
         }
+        let secret_values = self.configured_secret_values();
+        let secret_refs: Vec<&str> = secret_values.iter().map(String::as_str).collect();
         let exe = match self
             .runner
             .resolve_executable(self.config.executable.as_deref())
@@ -301,7 +333,10 @@ impl HostAdapter for CodexAdapter {
             Err(err) => {
                 return HostCapabilities::unavailable(
                     "codex",
-                    format!("failed to probe codex --version: {err}"),
+                    sanitize_reason_with_secrets(
+                        &format!("failed to probe codex --version: {err}"),
+                        &secret_refs,
+                    ),
                 );
             }
         };
@@ -336,7 +371,10 @@ impl HostAdapter for CodexAdapter {
             Err(err) => {
                 return HostCapabilities::unavailable(
                     "codex",
-                    format!("failed to probe codex exec --help: {err}"),
+                    sanitize_reason_with_secrets(
+                        &format!("failed to probe codex exec --help: {err}"),
+                        &secret_refs,
+                    ),
                 );
             }
         };
@@ -368,6 +406,8 @@ impl HostAdapter for CodexAdapter {
                 detail: err.to_string(),
             };
         }
+        let secret_values = self.configured_secret_values();
+        let secret_refs: Vec<&str> = secret_values.iter().map(String::as_str).collect();
         let fallback_correlation = SessionCorrelation::from_lease(
             &request.dispatch.lease,
             format!("codex:{}", request.dispatch.lease.attempt_id),
@@ -381,11 +421,12 @@ impl HostAdapter for CodexAdapter {
         }
 
         let caps = self.probe();
-        if !caps.available || !caps.supports_sandbox_flag {
+        if !caps.available || !caps.supports_sandbox_flag || !caps.supports_cancel {
             return AdapterOutcome::HostUnavailable {
                 provider: "codex".to_owned(),
                 detail: caps.unavailable_reason.unwrap_or_else(|| {
-                    "codex host cannot enforce required '--sandbox' policy".to_owned()
+                    "codex host cannot enforce required '--sandbox' and containment policy"
+                        .to_owned()
                 }),
             };
         }
@@ -475,15 +516,16 @@ impl HostAdapter for CodexAdapter {
                 },
                 StageError::SymlinkOrSpecial(detail) => AdapterOutcome::HostUnavailable {
                     provider: "codex".to_owned(),
-                    detail: sanitize_reason(&detail),
+                    detail: sanitize_reason_with_secrets(&detail, &secret_refs),
                 },
                 StageError::Io(detail) => AdapterOutcome::HostCrashed {
                     correlation: fallback_correlation,
                     worker_stopped: true,
                     exit_code: None,
-                    detail: sanitize_reason(&format!(
-                        "failed to stage codex read_scope workspace: {detail}"
-                    )),
+                    detail: sanitize_reason_with_secrets(
+                        &format!("failed to stage codex read_scope workspace: {detail}"),
+                        &secret_refs,
+                    ),
                 },
             };
         }
@@ -496,9 +538,12 @@ impl HostAdapter for CodexAdapter {
                         correlation: fallback_correlation,
                         worker_stopped: true,
                         exit_code: None,
-                        detail: sanitize_reason(&format!(
-                            "failed to snapshot codex staging workspace before execution: {err}"
-                        )),
+                        detail: sanitize_reason_with_secrets(
+                            &format!(
+                                "failed to snapshot codex staging workspace before execution: {err}"
+                            ),
+                            &secret_refs,
+                        ),
                     };
                 }
             };
@@ -620,9 +665,10 @@ impl HostAdapter for CodexAdapter {
                     correlation: fallback_correlation,
                     worker_stopped: false,
                     exit_code: None,
-                    detail: sanitize_reason(&format!(
-                        "codex supervision failed (worker exit unconfirmed): {err}"
-                    )),
+                    detail: sanitize_reason_with_secrets(
+                        &format!("codex supervision failed (worker exit unconfirmed): {err}"),
+                        &secret_refs,
+                    ),
                 };
             }
         };
@@ -637,6 +683,7 @@ impl HostAdapter for CodexAdapter {
         let stdout_text = String::from_utf8_lossy(&controlled.process.stdout);
         let stderr_text = String::from_utf8_lossy(&controlled.process.stderr);
         let session_id = extract_session_id(&stdout_text)
+            .filter(|id| redact_secrets(id, &secret_refs) == *id)
             .unwrap_or_else(|| fallback_correlation.session_id.clone());
         let correlation = SessionCorrelation::from_lease(&request.dispatch.lease, session_id);
 
@@ -650,7 +697,10 @@ impl HostAdapter for CodexAdapter {
         if controlled.cancelled {
             let reason = match scope_check {
                 Ok(_) => "cancelled by host request".to_owned(),
-                Err(msg) => sanitize_reason(&format!("cancelled by host request ({msg})")),
+                Err(msg) => sanitize_reason_with_secrets(
+                    &format!("cancelled by host request ({msg})"),
+                    &secret_refs,
+                ),
             };
             return AdapterOutcome::Cancelled {
                 correlation,
@@ -662,7 +712,10 @@ impl HostAdapter for CodexAdapter {
         if controlled.process.timed_out {
             let reason = match scope_check {
                 Ok(_) => "codex execution timed out".to_owned(),
-                Err(msg) => sanitize_reason(&format!("codex execution timed out ({msg})")),
+                Err(msg) => sanitize_reason_with_secrets(
+                    &format!("codex execution timed out ({msg})"),
+                    &secret_refs,
+                ),
             };
             return AdapterOutcome::TimedOut {
                 correlation,
@@ -680,8 +733,8 @@ impl HostAdapter for CodexAdapter {
             };
             let base = format!("codex exited unsuccessfully: {detail_source}");
             let detail = match scope_check {
-                Ok(_) => sanitize_reason(&base),
-                Err(msg) => sanitize_reason(&format!("{base}; {msg}")),
+                Ok(_) => sanitize_reason_with_secrets(&base, &secret_refs),
+                Err(msg) => sanitize_reason_with_secrets(&format!("{base}; {msg}"), &secret_refs),
             };
             return AdapterOutcome::HostCrashed {
                 correlation,
@@ -697,7 +750,7 @@ impl HostAdapter for CodexAdapter {
                 return AdapterOutcome::InvalidOutput {
                     correlation,
                     worker_stopped,
-                    detail: sanitize_reason(&detail),
+                    detail: sanitize_reason_with_secrets(&detail, &secret_refs),
                 };
             }
         };
@@ -710,7 +763,7 @@ impl HostAdapter for CodexAdapter {
                     return AdapterOutcome::InvalidOutput {
                         correlation,
                         worker_stopped,
-                        detail,
+                        detail: sanitize_reason_with_secrets(&detail, &secret_refs),
                     };
                 }
             }
@@ -732,7 +785,10 @@ impl HostAdapter for CodexAdapter {
                 return AdapterOutcome::InvalidOutput {
                     correlation,
                     worker_stopped,
-                    detail: sanitize_reason(&format!("invalid codex JSON result: {err}")),
+                    detail: sanitize_reason_with_secrets(
+                        &format!("invalid codex JSON result: {err}"),
+                        &secret_refs,
+                    ),
                 };
             }
         };
@@ -743,7 +799,7 @@ impl HostAdapter for CodexAdapter {
             task: envelope.task,
             task_revision: envelope.task_revision,
             status: envelope.status,
-            report: envelope.report,
+            report: redact_report(&envelope.report, &secret_refs),
             commit: envelope.commit,
             artifacts: envelope.artifacts,
         };
@@ -751,7 +807,10 @@ impl HostAdapter for CodexAdapter {
             return AdapterOutcome::InvalidOutput {
                 correlation,
                 worker_stopped,
-                detail: sanitize_reason(&format!("invalid codex worker result: {err}")),
+                detail: sanitize_reason_with_secrets(
+                    &format!("invalid codex worker result: {err}"),
+                    &secret_refs,
+                ),
             };
         }
         if request.policy == ExecutionPolicy::ReadOnly && result.commit.is_some() {
@@ -774,7 +833,7 @@ impl HostAdapter for CodexAdapter {
                 return AdapterOutcome::InvalidOutput {
                     correlation,
                     worker_stopped,
-                    detail: sanitize_reason(&detail),
+                    detail: sanitize_reason_with_secrets(&detail, &secret_refs),
                 };
             }
 
@@ -791,7 +850,7 @@ impl HostAdapter for CodexAdapter {
                     return AdapterOutcome::InvalidOutput {
                         correlation,
                         worker_stopped,
-                        detail: sanitize_reason(&detail),
+                        detail: sanitize_reason_with_secrets(&detail, &secret_refs),
                     };
                 }
             };
@@ -820,9 +879,10 @@ impl HostAdapter for CodexAdapter {
                             return AdapterOutcome::InvalidOutput {
                                 correlation,
                                 worker_stopped,
-                                detail: sanitize_reason(&format!(
-                                    "invalid codex worker result after commit: {err}"
-                                )),
+                                detail: sanitize_reason_with_secrets(
+                                    &format!("invalid codex worker result after commit: {err}"),
+                                    &secret_refs,
+                                ),
                             };
                         }
                     }
@@ -841,7 +901,7 @@ impl HostAdapter for CodexAdapter {
                         return AdapterOutcome::InvalidOutput {
                             correlation,
                             worker_stopped,
-                            detail: sanitize_reason(&detail),
+                            detail: sanitize_reason_with_secrets(&detail, &secret_refs),
                         };
                     }
                 }
@@ -900,7 +960,7 @@ fn parse_exec_help(
     HostCapabilities {
         schema: ADAPTER_SCHEMA,
         provider: "codex".to_owned(),
-        available: supports_sandbox_flag && has_read_root_confinement,
+        available: supports_sandbox_flag && has_read_root_confinement && supports_cancel,
         version,
         executable: Some(exe.to_owned()),
         supports_json_output,
@@ -920,6 +980,11 @@ fn parse_exec_help(
         } else if !has_read_root_confinement {
             Some(
                 "installed codex host does not advertise '--config' and runner lacks external read-root confinement"
+                    .to_owned(),
+            )
+        } else if !supports_cancel {
+            Some(
+                "configured codex runner cannot guarantee unbroken process-tree containment required to confirm worker stop (default ProcessCommandRunner currently requires Windows Job Objects)"
                     .to_owned(),
             )
         } else {

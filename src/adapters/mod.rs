@@ -260,11 +260,173 @@ pub trait HostAdapter {
     fn execute(&self, request: &AdapterRequest, cancel: &CancelToken) -> AdapterOutcome;
 }
 
+/// Redact configured secret values and common credential patterns (`Bearer ...`,
+/// provider API keys, and `*_KEY`/`*_TOKEN`/`PASSWORD` assignments) from untrusted
+/// host text before returning reports or persisting diagnostics.
+pub fn redact_secrets(input: &str, secret_values: &[&str]) -> String {
+    let mut secrets: Vec<&str> = secret_values
+        .iter()
+        .copied()
+        .filter(|s| !s.is_empty())
+        .collect();
+    secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    secrets.dedup();
+
+    let after_literals = if secrets.is_empty() {
+        input.to_owned()
+    } else {
+        let mut out = String::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            if let Some(matched) = secrets.iter().find(|s| input[i..].starts_with(**s)) {
+                out.push_str("[REDACTED]");
+                i += matched.len();
+            } else {
+                let ch = input[i..].chars().next().expect("non-empty tail");
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
+    };
+
+    redact_patterns(&after_literals)
+}
+
+fn is_cred_value_char(b: u8) -> bool {
+    !b.is_ascii_whitespace() && !matches!(b, b'"' | b'\'' | b',' | b';' | b')' | b']' | b'}')
+}
+
+fn is_prefixed_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+}
+
+fn redact_patterns(input: &str) -> String {
+    const ASSIGN_KEYS: [&str; 6] = [
+        "OPENAI_API_KEY=",
+        "API_KEY=",
+        "ACCESS_TOKEN=",
+        "AUTH_TOKEN=",
+        "SECRET_KEY=",
+        "PASSWORD=",
+    ];
+    const TOKEN_PREFIXES: [&str; 10] = [
+        "github_pat_",
+        "sk-",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "xoxb-",
+        "xoxp-",
+        "AIza",
+        "AKIA",
+    ];
+
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < input.len() {
+        let prev_is_word = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        let tail = &input[i..];
+
+        if !prev_is_word
+            && tail
+                .get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
+        {
+            let tok_start = i + 7;
+            let mut end = tok_start;
+            while end < bytes.len() && is_cred_value_char(bytes[end]) {
+                end += 1;
+            }
+            if end - tok_start >= 8 && !input[tok_start..end].starts_with("[REDACTED]") {
+                out.push_str("Bearer [REDACTED]");
+                i = end;
+                continue;
+            }
+        }
+
+        if !prev_is_word
+            && let Some(key) = ASSIGN_KEYS.iter().find(|k| {
+                tail.get(..k.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(k))
+            })
+        {
+            let val_start = i + key.len();
+            let (quote_prefix, actual_start) = match bytes.get(val_start) {
+                Some(b'"') => ("\"", val_start + 1),
+                Some(b'\'') => ("'", val_start + 1),
+                _ => ("", val_start),
+            };
+            let mut end = actual_start;
+            while end < bytes.len() && is_cred_value_char(bytes[end]) {
+                end += 1;
+            }
+            if end > actual_start && !input[actual_start..end].starts_with("[REDACTED]") {
+                out.push_str(&input[i..val_start]);
+                out.push_str(quote_prefix);
+                out.push_str("[REDACTED]");
+                i = end;
+                continue;
+            }
+        }
+
+        let prev_breaks_token = i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric() || matches!(bytes[i - 1], b'_' | b'-'));
+        if prev_breaks_token
+            && let Some(_prefix) = TOKEN_PREFIXES.iter().find(|p| tail.starts_with(**p))
+        {
+            let mut end = i;
+            while end < bytes.len() && is_prefixed_token_char(bytes[end]) {
+                end += 1;
+            }
+            while end > i && bytes[end - 1] == b'.' {
+                end -= 1;
+            }
+            if end - i >= 12 {
+                out.push_str("[REDACTED]");
+                i = end;
+                continue;
+            }
+        }
+
+        let ch = tail.chars().next().expect("non-empty tail");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+/// Redact configured secret values and credential patterns from a worker report.
+/// Preserves oversized inputs so `WorkerResult::validate()` still rejects them;
+/// if redaction expands a valid-sized report past `MAX_REPORT_BYTES`, truncates
+/// cleanly on a UTF-8 char boundary.
+pub(crate) fn redact_report(input: &str, secret_values: &[&str]) -> String {
+    let redacted = redact_secrets(input, secret_values);
+    if input.len() <= MAX_REPORT_BYTES && redacted.len() > MAX_REPORT_BYTES {
+        let mut end = MAX_REPORT_BYTES;
+        while !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        return redacted[..end].to_owned();
+    }
+    redacted
+}
+
 /// Sanitize a diagnostic reason/detail so it satisfies `TaskJournal` text rules
-/// (non-blank, no control characters, bounded to `MAX_DETAIL_BYTES`).
+/// (non-blank, redacted, no control characters, bounded to `MAX_DETAIL_BYTES`).
 pub fn sanitize_reason(input: &str) -> String {
-    let mut cleaned = String::with_capacity(input.len().min(MAX_DETAIL_BYTES));
-    for ch in input.chars() {
+    sanitize_reason_with_secrets(input, &[])
+}
+
+/// Like `sanitize_reason`, while also redacting configured literal secret values.
+pub fn sanitize_reason_with_secrets(input: &str, secret_values: &[&str]) -> String {
+    let redacted = redact_secrets(input, secret_values);
+    let mut cleaned = String::with_capacity(redacted.len().min(MAX_DETAIL_BYTES));
+    for ch in redacted.chars() {
         let mapped = if ch.is_control() { ' ' } else { ch };
         if cleaned.len() + mapped.len_utf8() > MAX_DETAIL_BYTES {
             break;
@@ -276,6 +438,25 @@ pub fn sanitize_reason(input: &str) -> String {
         "host adapter reported unspecified reason".to_owned()
     } else {
         trimmed.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_secrets_scrubs_configured_and_pattern_credentials() {
+        let input = "using opaque-secret-xyz and sk-proj-1234567890abcdef \
+                     with Bearer super_secret_token_99 and OPENAI_API_KEY=\"rawval123\" \
+                     keeping src/adapters/codex.rs intact";
+        let redacted = redact_secrets(input, &["opaque-secret", "opaque-secret-xyz"]);
+        assert!(!redacted.contains("opaque-secret"), "{redacted}");
+        assert!(!redacted.contains("sk-proj-1234567890abcdef"), "{redacted}");
+        assert!(!redacted.contains("super_secret_token_99"), "{redacted}");
+        assert!(!redacted.contains("rawval123"), "{redacted}");
+        assert!(redacted.contains("src/adapters/codex.rs"), "{redacted}");
+        assert!(redacted.contains("[REDACTED]"), "{redacted}");
     }
 }
 
